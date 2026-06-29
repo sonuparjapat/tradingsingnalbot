@@ -1,0 +1,4 @@
+kiteconnect
+requests
+pandas
+numpy
