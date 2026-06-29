@@ -1,0 +1,4 @@
+.env
+backtest_results_*.csv
+__pycache__/
+*.pyc

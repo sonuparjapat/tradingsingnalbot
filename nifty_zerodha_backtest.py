@@ -14,16 +14,19 @@ Matches bot v7.0 exactly:
 from kiteconnect import KiteConnect
 import pandas as pd
 import numpy as np
-import webbrowser
+import webbrowser, os
 from datetime import datetime, timedelta, time as dtime
+from dotenv import load_dotenv
 import warnings
 warnings.filterwarnings('ignore')
 
+load_dotenv()
+
 # ─────────────────────────────────────────
-#   CREDENTIALS
+#   CREDENTIALS (from .env)
 # ─────────────────────────────────────────
-API_KEY    = "bcofpecpgg3wdx1z"
-API_SECRET = "jp6lphasdqdof8jnuo0zx2xgpu73k49o"
+API_KEY    = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
 
 # ─────────────────────────────────────────
 #   CONFIG — matches bot v7.0 exactly
@@ -31,7 +34,7 @@ API_SECRET = "jp6lphasdqdof8jnuo0zx2xgpu73k49o"
 NIFTY_TOKEN = 256265
 SL_PCT      = 0.00063   # ~15 pts SL
 TARGET_PCT  = 0.00071   # ~17 pts target
-BREAKEVEN_PCT = 0.00042 # ~10 pts — move SL to entry
+BREAKEVEN_PCT = 0.00034 # ~8 pts — move SL to entry (saves Jun 10/12 trades)
 MOMENTUM_CANDLES = 3    # check momentum after 3 candles (15 min)
 MOMENTUM_MIN = 5        # must be +5pts in favor, else exit early
 MAX_TRADES  = 3
@@ -151,6 +154,13 @@ def analyze_candle(o,h,l,c):
     doji=(body/tr)<0.1
     return doji,(not doji and c>o and uw<=body),(not doji and c<o and lw<=body)
 
+def get_prev_day_hl(df, date):
+    prev = df[df.index.date < date]
+    if prev.empty: return None, None
+    last_date = prev.index.date[-1]
+    day_data = prev[prev.index.date == last_date]
+    return float(day_data['High'].max()), float(day_data['Low'].min())
+
 def get_orb_for_day(df, date):
     td = df[df.index.date==date]
     if td.empty: return None,None
@@ -196,7 +206,7 @@ def run_backtest(df5, df15, fut_vol):
     days=len(set(df5.index.date))
     print(f"  Candles: {len(df5)} | Days: {days}\n")
 
-    trades=[]; daily_count={}; last_sig={}; orb_cache={}
+    trades=[]; daily_count={}; last_sig={}; orb_cache={}; pdhl_cache={}
 
     for i in range(20,len(df5)-1):
         row=df5.iloc[i]; prev=df5.iloc[i-1]
@@ -238,8 +248,16 @@ def run_backtest(df5, df15, fut_vol):
         if not buy_t1 and not sell_t1: continue
         if is_doji: continue
 
+        # S&R: Previous Day High/Low
+        if date not in pdhl_cache:
+            pdhl_cache[date] = get_prev_day_hl(df5, date)
+        pdh, pdl = pdhl_cache[date]
+
         if buy_t1:
             if not (RSI_BUY_MIN<=rsi<=RSI_BUY_MAX): continue
+            # S&R: skip BUY if resistance (PDH) is closer than our target
+            tgt_dist = price * TARGET_PCT
+            if pdh and 0 < (pdh - price) < tgt_dist: continue
             t2=sum([True, trend15==True, bull_clean, expiry_safe, orb_bull])
             if t2<CE_MIN_T2: continue
             if last_sig.get(date)=="BUY": continue
@@ -247,6 +265,9 @@ def run_backtest(df5, df15, fut_vol):
             conf="HIGH" if t2==5 else ("NORMAL" if t2>=3 else "WEAK")
         else:
             if not (RSI_SELL_MIN<=rsi<=RSI_SELL_MAX): continue
+            # S&R: skip SELL if support (PDL) is closer than our target
+            tgt_dist = price * TARGET_PCT
+            if pdl and 0 < (price - pdl) < tgt_dist: continue
             t2=sum([True, trend15==False, bear_clean, expiry_safe, orb_bear])
             if t2<PE_MIN_T2: continue
             if last_sig.get(date)=="SELL": continue
@@ -448,21 +469,22 @@ def main():
 
     if not login(): return
 
-    print("📥 Fetching Nifty 5 min data (60 days)...")
-    df5=fetch_data(NIFTY_TOKEN,"5minute",days=60)
+    DAYS = 60
+    print(f"📥 Fetching Nifty 5 min data ({DAYS} days)...")
+    df5=fetch_data(NIFTY_TOKEN,"5minute",days=DAYS)
     if df5 is None or df5.empty:
         print("❌ Failed"); return
     print(f"✅ {len(df5)} candles | {df5.index[0].date()} to {df5.index[-1].date()}")
 
     print("📥 Fetching 15 min data...")
-    df15=fetch_data(NIFTY_TOKEN,"15minute",days=60)
+    df15=fetch_data(NIFTY_TOKEN,"15minute",days=DAYS)
     print(f"✅ {len(df15)} candles (15 min)" if df15 is not None else "⚠️ Not available")
 
     print("📥 Finding Nifty Futures for volume...")
     fut_token=find_nifty_fut_token()
     fut_vol=None
     if fut_token:
-        fut_vol=fetch_data(fut_token,"5minute",days=60)
+        fut_vol=fetch_data(fut_token,"5minute",days=DAYS)
         if fut_vol is not None and fut_vol['Volume'].sum()>0:
             print(f"✅ Futures volume: {len(fut_vol)} candles")
         else:

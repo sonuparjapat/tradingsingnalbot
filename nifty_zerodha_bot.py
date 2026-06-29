@@ -5,7 +5,7 @@ NIFTY SIGNAL BOT — MATCHES BACKTEST EXACTLY
 Tier 1 (ALL 5): VWAP + Supertrend + EMA cross/expanding
                  + Volume spike + Breakout
 Tier 2: 15min trend, candle, expiry, ORB
-Target: ~17pts | SL: ~15pts | Breakeven: ~10pts
+Target: ~17pts | SL: ~15pts | Breakeven: ~8pts
 Weak exit: if <5pts after 15min
 =============================================================
 """
@@ -13,22 +13,25 @@ Weak exit: if <5pts after 15min
 from kiteconnect import KiteConnect
 import pandas as pd
 import numpy as np
-import requests, time, webbrowser
+import requests, time, webbrowser, os
 from datetime import datetime, timedelta, time as dtime
+from dotenv import load_dotenv
 import warnings
 warnings.filterwarnings('ignore')
 
-# ─── CREDENTIALS ───
-API_KEY    = "bcofpecpgg3wdx1z"
-API_SECRET = "jp6lphasdqdof8jnuo0zx2xgpu73k49o"
-BOT_TOKEN  = "8843915646:AAEhviIvV7dELl3fYdpqxxLHUL7q2Pjf3do"
-CHAT_ID    = "5276688040"
+load_dotenv()
+
+# ─── CREDENTIALS (from .env) ───
+API_KEY    = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+BOT_TOKEN  = os.getenv("BOT_TOKEN")
+CHAT_ID    = os.getenv("CHAT_ID")
 
 # ─── CONFIG — same as backtest ───
 NIFTY_TOKEN = 256265
 SL_PCT         = 0.00063
 TARGET_PCT     = 0.00071
-BREAKEVEN_PCT  = 0.00042
+BREAKEVEN_PCT  = 0.00034  # ~8pts — matches backtest
 MAX_TRADES     = 3
 STRIKE_GAP     = 50
 VIX_LIMIT      = 20
@@ -157,6 +160,14 @@ def get_expiry_info():
     elif day == 3: return True,  "Thursday 🟢"
     else: return True, "Friday 🟢"
 
+def get_prev_day_hl(df):
+    today = datetime.now().date()
+    prev = df[df.index.date < today]
+    if prev.empty: return None, None
+    last_date = prev.index.date[-1]
+    day_data = prev[prev.index.date == last_date]
+    return float(day_data['High'].max()), float(day_data['Low'].min())
+
 def get_strike(price, signal):
     atm = round(price / STRIKE_GAP) * STRIKE_GAP
     if signal == "BUY": return f"{atm} CE"
@@ -223,8 +234,14 @@ def check_signals(df5, df15, fut_vol):
     if is_doji:
         return "SKIP", price, {}, {}, None, rsi, expiry_label
 
+    # S&R: Previous Day High/Low
+    pdh, pdl = get_prev_day_hl(df5)
+    tgt_dist = price * TARGET_PCT
+
     if buy_t1:
         if not (RSI_BUY_MIN <= rsi <= RSI_BUY_MAX):
+            return None, price, {}, {}, None, rsi, expiry_label
+        if pdh and 0 < (pdh - price) < tgt_dist:
             return None, price, {}, {}, None, rsi, expiry_label
         tier1 = {
             "Price > VWAP": True, "Supertrend Green": True,
@@ -247,6 +264,8 @@ def check_signals(df5, df15, fut_vol):
     else:
         if not (RSI_SELL_MIN <= rsi <= RSI_SELL_MAX):
             return None, price, {}, {}, None, rsi, expiry_label
+        if pdl and 0 < (price - pdl) < tgt_dist:
+            return None, price, {}, {}, None, rsi, expiry_label
         tier1 = {
             "Price < VWAP": True, "Supertrend Red": True,
             "EMA 9/20 momentum": True, "Volume Spike": True,
@@ -266,7 +285,7 @@ def check_signals(df5, df15, fut_vol):
         return "SELL", price, tier1, tier2, conf, rsi, expiry_label
 
 # ─── ALERT FORMAT ───
-def format_alert(signal, price, tier1, tier2, conf, rsi, expiry_label, vix, orb_high, orb_low, trade_num):
+def format_alert(signal, price, tier1, tier2, conf, rsi, expiry_label, vix, orb_high, orb_low, trade_num, pdh=None, pdl=None):
     now = datetime.now().strftime("%d %b %Y %I:%M %p")
     score = sum(tier2.values())
     strike = get_strike(price, signal)
@@ -305,7 +324,19 @@ def format_alert(signal, price, tier1, tier2, conf, rsi, expiry_label, vix, orb_
     for k, v in tier2.items():
         msg += f"\n  {'✅' if v else '❌'} {k}"
 
-    msg += f"""
+    # S&R context (info only — you decide)
+    sr_info = ""
+    if pdh and pdl:
+        dist_pdh = round(pdh - price, 0)
+        dist_pdl = round(price - pdl, 0)
+        if signal == "BUY":
+            warn = " ⚠️ RESISTANCE NEAR" if 0 < dist_pdh < 30 else ""
+            sr_info = f"\n\n🏗️ <b>Support & Resistance:</b>\n  📊 PDH: {pdh:.0f} ({dist_pdh:+.0f}pts){warn}\n  📊 PDL: {pdl:.0f} ({dist_pdl:+.0f}pts below)"
+        else:
+            warn = " ⚠️ SUPPORT NEAR" if 0 < dist_pdl < 30 else ""
+            sr_info = f"\n\n🏗️ <b>Support & Resistance:</b>\n  📊 PDH: {pdh:.0f} ({dist_pdh:+.0f}pts above)\n  📊 PDL: {pdl:.0f} ({dist_pdl:+.0f}pts){warn}"
+
+    msg += f"""{sr_info}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 📉 VIX: {vix} | Expiry: {expiry_label}
@@ -335,7 +366,7 @@ def run_bot():
         "🤖 <b>Nifty Signal Bot Started</b>\n\n"
         "📊 Tier1: VWAP + Supertrend + EMA + Volume + Breakout\n"
         "🎯 Target: ~17pts | SL: ~15pts\n"
-        "⚖️ Breakeven at ~10pts\n"
+        "⚖️ Breakeven at ~8pts\n"
         "⏰ 9:30 AM — 2:00 PM\n\n"
         "Watching Nifty 5 min chart...")
 
@@ -415,9 +446,10 @@ def run_bot():
                     sl_pts = round(price * SL_PCT, 1)
                     print(f"  🚨 {conf} {signal} | T2:{score}/5 | "
                           f"TGT:{tgt_pts:.0f}pts SL:{sl_pts:.0f}pts | #{trades_today}")
+                    pdh, pdl = get_prev_day_hl(df5)
                     alert = format_alert(signal, price, tier1, tier2, conf, rsi,
                         expiry_label, round(vix,1) if vix else "N/A",
-                        orb_high, orb_low, trades_today)
+                        orb_high, orb_low, trades_today, pdh, pdl)
                     send_telegram(alert)
 
             time.sleep(300)
