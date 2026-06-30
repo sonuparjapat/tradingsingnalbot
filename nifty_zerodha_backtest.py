@@ -14,9 +14,12 @@ Matches bot v7.0 exactly:
 from kiteconnect import KiteConnect
 import pandas as pd
 import numpy as np
-import webbrowser, os
+import webbrowser, os, json, time
 from datetime import datetime, timedelta, time as dtime
 from dotenv import load_dotenv
+from urllib.parse import urlparse, parse_qs
+import requests
+import pyotp
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -27,6 +30,9 @@ load_dotenv()
 # ─────────────────────────────────────────
 API_KEY    = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
+KITE_USER_ID     = os.getenv("KITE_USER_ID")
+KITE_PASSWORD    = os.getenv("KITE_PASSWORD")
+KITE_TOTP_SECRET = os.getenv("KITE_TOTP_SECRET")
 
 # ─────────────────────────────────────────
 #   CONFIG — matches bot v7.0 exactly
@@ -53,12 +59,119 @@ PE_MIN_T2 = 4
 
 VOL_MULTI   = 1.2    # was 1.3 — slightly more signals qualify
 
+# ── EXPIRY DAY CAUTION (fake breakouts + extreme theta decay) ──
+# Not blocked entirely — expiry day can be very profitable on real moves.
+# Just requires stronger confirmation and exits faster if it's not working.
+EXPIRY_WEEKDAY      = 1            # Tuesday for NIFTY (change to 3=Thursday for SENSEX later)
+EXPIRY_VOL_MULTI    = 1.6          # was 1.2 — filter out fake breakout candles with weak volume
+EXPIRY_CE_MIN_T2    = 4            # was 3 — need stronger confirmation on CE too
+EXPIRY_TRADE_END    = dtime(13, 0) # was 14:00 — stop new entries earlier, theta accelerates after
+EXPIRY_MOMENTUM_CANDLES = 2        # was 3 — check momentum after 10min not 15min, exit dead trades faster
+EXPIRY_BREAKOUT_BUFFER  = 3        # extra pts above prev high/below prev low — filters fake pokes, expiry day only
+
 # ─────────────────────────────────────────
-#   LOGIN
+#   LOGIN (token cache + TOTP auto-login, matches bot exactly)
 # ─────────────────────────────────────────
 kite = KiteConnect(api_key=API_KEY)
+TOKEN_FILE = "kite_token.json"
 
-def login():
+def load_cached_token():
+    """Kite tokens are valid until ~6 AM the next day. Reuse today's token
+    instead of logging in again on every backtest run."""
+    if not os.path.exists(TOKEN_FILE):
+        return False
+    try:
+        with open(TOKEN_FILE, "r") as f:
+            data = json.load(f)
+        if data.get("date") != datetime.now().strftime("%Y-%m-%d"):
+            return False  # token is from a previous day — expired
+        kite.set_access_token(data["access_token"])
+        kite.profile()  # verify it actually still works
+        print("✅ Reused cached token from earlier today — no login needed\n")
+        return True
+    except Exception as e:
+        print(f"  Cached token invalid ({e}), logging in fresh...")
+        return False
+
+def save_cached_token(access_token):
+    try:
+        with open(TOKEN_FILE, "w") as f:
+            json.dump({"access_token": access_token, "date": datetime.now().strftime("%Y-%m-%d")}, f)
+    except Exception as e:
+        print(f"⚠️ Could not cache token: {e}")
+
+def auto_login():
+    """Auto-login using TOTP — no manual token needed."""
+    try:
+        print("🔐 Auto-login with TOTP...")
+        sess = requests.Session()
+        # Realistic browser headers — bare 'python-requests' UA gets flagged by
+        # Zerodha's anti-bot checks, especially from new/datacenter IPs.
+        sess.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://kite.zerodha.com/",
+            "Origin": "https://kite.zerodha.com",
+            "X-Kite-Version": "3.0.0",
+        })
+        sess.get(kite.login_url(), allow_redirects=True)
+
+        resp = sess.post("https://kite.zerodha.com/api/login", data={
+            "user_id": KITE_USER_ID, "password": KITE_PASSWORD
+        })
+        data = resp.json()
+        if data.get("status") != "success":
+            print(f"❌ Login step 1 failed: {data.get('message','Unknown error')}")
+            return False
+        request_id = data["data"]["request_id"]
+
+        totp = pyotp.TOTP(KITE_TOTP_SECRET).now()
+        resp = sess.post("https://kite.zerodha.com/api/twofa", data={
+            "user_id": KITE_USER_ID, "request_id": request_id,
+            "twofa_value": totp, "twofa_type": "totp"
+        })
+        data = resp.json()
+        if data.get("status") != "success":
+            print(f"❌ TOTP failed: {data.get('message','Unknown error')}")
+            return False
+
+        time.sleep(1)  # let the session fully register server-side before the redirect fetch
+
+        # Kite redirects twice: /connect/login -> /connect/finish?sess_id=... -> <redirect_url>?request_token=...
+        redirect_url = ""
+        next_url = kite.login_url()
+        for _ in range(3):
+            resp = sess.get(next_url, allow_redirects=False)
+            if resp.status_code in (301, 302, 303, 307, 308):
+                next_url = resp.headers.get("Location", "")
+                if next_url.startswith("/"):
+                    next_url = "https://kite.zerodha.com" + next_url
+                redirect_url = next_url
+                if "request_token=" in next_url:
+                    break
+            else:
+                redirect_url = resp.url
+                break
+
+        parsed = parse_qs(urlparse(redirect_url).query)
+        request_token = parsed.get("request_token", [None])[0]
+        if not request_token:
+            print(f"❌ No request_token in redirect. Last URL={redirect_url[:200]}")
+            return False
+
+        session_data = kite.generate_session(request_token, api_secret=API_SECRET)
+        kite.set_access_token(session_data["access_token"])
+        save_cached_token(session_data["access_token"])
+        print("✅ Auto-login successful!\n")
+        return True
+    except Exception as e:
+        print(f"❌ Auto-login failed: {e}")
+        return False
+
+def manual_login():
+    """Fallback: manual token paste."""
     login_url = kite.login_url()
     print(f"\n🌐 Opening Zerodha login...")
     webbrowser.open(login_url)
@@ -67,11 +180,22 @@ def login():
     try:
         data = kite.generate_session(request_token, api_secret=API_SECRET)
         kite.set_access_token(data["access_token"])
+        save_cached_token(data["access_token"])
         print("✅ Login successful!\n")
         return True
     except Exception as e:
         print(f"❌ Login failed: {e}")
         return False
+
+def login():
+    """Reuse today's cached token if valid. Otherwise auto-login, fallback to manual."""
+    if load_cached_token():
+        return True
+    if KITE_USER_ID and KITE_PASSWORD and KITE_TOTP_SECRET and \
+       KITE_USER_ID != "YOUR_USER_ID":
+        if auto_login(): return True
+        print("⚠️ Auto-login failed, trying manual...")
+    return manual_login()
 
 # ─────────────────────────────────────────
 #   DATA
@@ -212,7 +336,14 @@ def run_backtest(df5, df15, fut_vol):
         row=df5.iloc[i]; prev=df5.iloc[i-1]
         ts=df5.index[i]; date=ts.date(); t=ts.time()
 
-        if t<TRADE_START or t>TRADE_END: continue
+        is_expiry_day = ts.weekday() == EXPIRY_WEEKDAY
+        day_trade_end = EXPIRY_TRADE_END if is_expiry_day else TRADE_END
+        day_vol_multi = EXPIRY_VOL_MULTI if is_expiry_day else VOL_MULTI
+        day_ce_min_t2 = EXPIRY_CE_MIN_T2 if is_expiry_day else CE_MIN_T2
+        day_momentum_candles = EXPIRY_MOMENTUM_CANDLES if is_expiry_day else MOMENTUM_CANDLES
+        day_breakout_buffer = EXPIRY_BREAKOUT_BUFFER if is_expiry_day else 0
+
+        if t<TRADE_START or t>day_trade_end: continue
         if daily_count.get(date,0)>=MAX_TRADES: continue
 
         price=float(row['Close'])
@@ -227,7 +358,7 @@ def run_backtest(df5, df15, fut_vol):
         trend15=row.get('Trend15',None)
 
         is_doji,bull_clean,bear_clean=analyze_candle(o,h,l,c)
-        expiry_safe=ts.weekday()!=1  # Tuesday = NIFTY weekly expiry
+        expiry_safe=not is_expiry_day  # NIFTY weekly expiry — soft Tier2 factor + hard caution below
 
         if date not in orb_cache:
             orb_cache[date]=get_orb_for_day(df5,date)
@@ -235,12 +366,12 @@ def run_backtest(df5, df15, fut_vol):
         orb_bull=(orb_high is not None) and (price>orb_high)
         orb_bear=(orb_low  is not None) and (price<orb_low)
 
-        vol_spike = vol>(avg_vol*VOL_MULTI) if avg_vol>0 else False
+        vol_spike = vol>(avg_vol*day_vol_multi) if avg_vol>0 else False
         ema_gap = ema9 - ema20; prev_gap = pe9 - pe20
         cross_up   = (pe9<=pe20 and ema9>ema20) or (ema9>ema20 and ema_gap > prev_gap > 0)
         cross_down = (pe9>=pe20 and ema9<ema20) or (ema9<ema20 and ema_gap < prev_gap < 0)
-        breakout  = price>ph
-        breakdown = price<pl
+        breakout  = price > ph + day_breakout_buffer   # extra buffer on expiry day filters fake pokes
+        breakdown = price < pl - day_breakout_buffer
 
         buy_t1  = all([price>vwap, st==True,  cross_up,   vol_spike, breakout])
         sell_t1 = all([price<vwap, st==False, cross_down, vol_spike, breakdown])
@@ -259,7 +390,7 @@ def run_backtest(df5, df15, fut_vol):
             tgt_dist = price * TARGET_PCT
             if pdh and 0 < (pdh - price) < tgt_dist: continue
             t2=sum([True, trend15==True, bull_clean, expiry_safe, orb_bull])
-            if t2<CE_MIN_T2: continue
+            if t2<day_ce_min_t2: continue
             if last_sig.get(date)=="BUY": continue
             signal="BUY"
             conf="HIGH" if t2==5 else ("NORMAL" if t2>=3 else "WEAK")
@@ -296,8 +427,8 @@ def run_backtest(df5, df15, fut_vol):
             else:
                 max_favorable = max(max_favorable, price - fl)
 
-            # Early exit: no momentum after 15 min = weak breakout
-            if j - i == MOMENTUM_CANDLES and max_favorable < MOMENTUM_MIN:
+            # Early exit: no momentum = weak breakout (faster check on expiry day — theta burns fast)
+            if j - i == day_momentum_candles and max_favorable < MOMENTUM_MIN:
                 fc=float(df5.iloc[j]['Close'])
                 exit_price=fc; outcome="WEAK"; break
 
@@ -469,7 +600,7 @@ def main():
 
     if not login(): return
 
-    DAYS = 60
+    DAYS = 100
     print(f"📥 Fetching Nifty 5 min data ({DAYS} days)...")
     df5=fetch_data(NIFTY_TOKEN,"5minute",days=DAYS)
     if df5 is None or df5.empty:

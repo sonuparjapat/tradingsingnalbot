@@ -1,4 +1,8 @@
 .env
 backtest_results_*.csv
+backtest_telegram_*.csv
+position_state.json
+kite_token.json
+deploy/*.key
 __pycache__/
 *.pyc
