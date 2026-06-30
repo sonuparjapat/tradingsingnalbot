@@ -1,0 +1,18 @@
+[Unit]
+Description=Nifty Morning Scanner (relaxed filters, signal-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/tradingsignalbot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -u /home/ubuntu/tradingsignalbot/nifty_morning_scanner.py
+Restart=always
+RestartSec=15
+StandardOutput=append:/home/ubuntu/tradingsignalbot/morning_scanner.log
+StandardError=append:/home/ubuntu/tradingsignalbot/morning_scanner_error.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,13 +1,17 @@
 """
 =============================================================
-NIFTY BACKTESTER v5.0 — FINAL IMPROVED VERSION
+SENSEX BACKTESTER v1.0 — same proven engine as NIFTY
 =============================================================
-Matches bot v7.0 exactly:
-- CE: minimum 3/5 Tier 2
-- PE: minimum 4/5 Tier 2 (stricter)
-- Max 3 trades per day
-- Trading hours: 9:30 AM to 2:30 PM
-- Target: 0.5% | SL: 0.3%
+Identical strategy logic to nifty_zerodha_backtest.py, adapted for SENSEX:
+- Exchange: BSE (spot) / BFO (futures) instead of NSE/NFO
+- Expiry day: Thursday instead of Tuesday (EXPIRY_WEEKDAY=3)
+- Strike gap: 100 instead of 50 (SENSEX trades ~80,000+ levels)
+- SENSEX instrument token looked up dynamically (not hardcoded)
+
+Everything else — Tier 1 (5 conditions), Tier 2 scoring, S&R filter,
+expiry-day caution, breakeven/weak-exit — is byte-for-byte the same
+logic that's proven profitable on NIFTY. SL/Target use percentages
+(not fixed points), so they naturally scale to SENSEX's price level.
 =============================================================
 """
 
@@ -26,7 +30,7 @@ warnings.filterwarnings('ignore')
 load_dotenv()
 
 # ─────────────────────────────────────────
-#   CREDENTIALS (from .env)
+#   CREDENTIALS (from .env) — same Kite account as NIFTY bot
 # ─────────────────────────────────────────
 API_KEY    = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
@@ -35,36 +39,28 @@ KITE_PASSWORD    = os.getenv("KITE_PASSWORD")
 KITE_TOTP_SECRET = os.getenv("KITE_TOTP_SECRET")
 
 # ─────────────────────────────────────────
-#   CONFIG — matches bot v7.0 exactly
+#   CONFIG — identical to NIFTY except where noted
 # ─────────────────────────────────────────
-NIFTY_TOKEN = 256265
-SL_PCT      = 0.00063   # ~15 pts SL
-TARGET_PCT  = 0.00071   # ~17 pts target
-BREAKEVEN_PCT = 0.00034 # ~8 pts — move SL to entry (saves Jun 10/12 trades)
-MOMENTUM_CANDLES = 3    # check momentum after 3 candles (15 min)
-MOMENTUM_MIN = 5        # must be +5pts in favor, else exit early
+SL_PCT      = 0.00063   # same % as NIFTY — scales naturally to SENSEX price level
+TARGET_PCT  = 0.00071
+BREAKEVEN_PCT = 0.00034
+MOMENTUM_CANDLES = 3
+MOMENTUM_MIN = 5
 MAX_TRADES  = 3
 CAPITAL     = 100000
-STRIKE_GAP  = 50
-LOT_SIZE    = int(os.getenv("LOT_SIZE", 75))
+STRIKE_GAP  = 100       # SENSEX strikes are 100pt apart (NIFTY was 50)
+LOT_SIZE    = int(os.getenv("SENSEX_LOT_SIZE", os.getenv("LOT_SIZE", 20)))
 
 # ── OPTION PREMIUM ESTIMATE (replaces flat spot-% P&L) ──
-# Kite doesn't retain historical candles for expired weekly option contracts, so
-# real premium history isn't fetchable for a 60-100 day backtest. Instead, P&L is
-# estimated from the spot move using a moneyness-aware delta: an ATM option's
-# delta isn't a constant 0.5 — it rises toward ~1.0 as the trade moves further
-# in-the-money (gamma) and falls as it moves against us. This is exactly why a
-# 20pt spot move sometimes only moves the premium 6pts (weak/early move = low
-# delta) while a strong breakout moves it almost 1:1 (high delta). A theta
-# haircut also knocks down profits on expiry day, when time value erodes fastest.
-DELTA_BASE        = 0.5     # ATM delta at the moment of entry (moneyness = 0)
-DELTA_SCALE_PCT   = 0.0048  # spot move (% of price) for delta to approach ~0.85 (~120pts on NIFTY)
-EXPIRY_THETA_HAIRCUT_PCT = 0.15  # knock 15% off premium gains on expiry day
+# Same model as NIFTY — % of spot price, so it auto-scales without separate
+# calibration (see nifty_zerodha_backtest.py for the full rationale).
+DELTA_BASE        = 0.5
+DELTA_SCALE_PCT   = 0.0048
+EXPIRY_THETA_HAIRCUT_PCT = 0.15
 
 # ── TRAILING STOP (locks in profit on big winners instead of round-tripping to BE) ──
-# Scales off the breakeven distance so it auto-adjusts for fixed-% vs ATR mode.
-TRAIL_TRIGGER_MULT = 1.5    # activates once favorable move >= 1.5x the breakeven distance
-TRAIL_STEP_MULT    = 0.6    # trailing SL follows this far (x breakeven distance) behind the peak
+TRAIL_TRIGGER_MULT = 1.5
+TRAIL_STEP_MULT    = 0.6
 
 RSI_BUY_MIN  = 48; RSI_BUY_MAX  = 63
 RSI_SELL_MIN = 37; RSI_SELL_MAX = 53
@@ -76,59 +72,47 @@ HARD_EXIT   = dtime(15, 10)
 CE_MIN_T2 = 3
 PE_MIN_T2 = 4
 
-VOL_MULTI   = 1.2    # was 1.3 — slightly more signals qualify
+VOL_MULTI   = 1.2
 
-# ── EXPIRY DAY CAUTION (fake breakouts + extreme theta decay) ──
-# Not blocked entirely — expiry day can be very profitable on real moves.
-# Just requires stronger confirmation and exits faster if it's not working.
-EXPIRY_WEEKDAY      = 1            # Tuesday for NIFTY (change to 3=Thursday for SENSEX later)
-EXPIRY_VOL_MULTI    = 1.6          # was 1.2 — filter out fake breakout candles with weak volume
-EXPIRY_CE_MIN_T2    = 4            # was 3 — need stronger confirmation on CE too
-EXPIRY_TRADE_END    = dtime(13, 0) # was 14:00 — stop new entries earlier, theta accelerates after
-EXPIRY_MOMENTUM_CANDLES = 2        # was 3 — check momentum after 10min not 15min, exit dead trades faster
-EXPIRY_BREAKOUT_BUFFER  = 3        # extra pts above prev high/below prev low — filters fake pokes, expiry day only
+# ── EXPIRY DAY CAUTION ──
+EXPIRY_WEEKDAY      = 3            # Thursday for SENSEX (NIFTY uses 1=Tuesday)
+EXPIRY_VOL_MULTI    = 1.6
+EXPIRY_CE_MIN_T2    = 4
+EXPIRY_TRADE_END    = dtime(13, 0)
+EXPIRY_MOMENTUM_CANDLES = 2
+EXPIRY_BREAKOUT_BUFFER  = 3
 
 # ── ATR-BASED DYNAMIC RISK (EXPERIMENTAL — A/B toggle, default OFF) ──
-# Fixed %-based SL/Target don't adapt to today's actual volatility. ATR-based
-# versions widen on volatile days, tighten on calm days. Multipliers below are
-# calibrated so that at a "typical" ATR(~30pts on NIFTY), this produces
-# almost the SAME distances as the current fixed values — so on average days
-# behavior is similar, but it adapts on unusually calm/volatile days.
-# Set True to test; compare results against this flag set False before keeping.
+# Same multipliers as NIFTY — ATR naturally scales to SENSEX's point-level,
+# so no separate calibration needed. Set True to test vs the fixed-% baseline.
 USE_ATR_DYNAMIC   = False
 ATR_PERIOD        = 14
-SL_ATR_MULT       = 0.50    # ATR(30) × 0.50 ≈ 15pts, matches current SL
-TARGET_ATR_MULT   = 0.5635  # preserves current Target/SL ratio (1.127)
-BE_ATR_MULT       = 0.270   # preserves current Breakeven/SL ratio (0.54)
-MOMENTUM_ATR_MULT = 0.167   # ATR(30) × 0.167 ≈ 5pts, matches current momentum threshold
-BUFFER_ATR_MULT   = 0.10    # ATR(30) × 0.10 ≈ 3pts, matches current expiry breakout buffer
+SL_ATR_MULT       = 0.50
+TARGET_ATR_MULT   = 0.5635
+BE_ATR_MULT       = 0.270
+MOMENTUM_ATR_MULT = 0.167
+BUFFER_ATR_MULT   = 0.10
 
 # ── BREAKOUT CONFIRMATION (EXPERIMENTAL — A/B toggle, default OFF) ──
-# Current logic enters as soon as ONE candle closes above the prior candle's
-# high — a single-candle wick spike can trigger this and immediately reverse
-# (fake breakout). When True, requires the breakout level to hold for TWO
-# consecutive candles (the breakout candle + the next one) before entering —
-# entry shifts one candle later but should filter single-candle fakeouts.
+# Same model as NIFTY — see nifty_zerodha_backtest.py for full rationale.
 USE_BREAKOUT_CONFIRM = False
 
 # ─────────────────────────────────────────
-#   LOGIN (token cache + TOTP auto-login, matches bot exactly)
+#   LOGIN (identical to NIFTY bot/backtest — same Kite account/session)
 # ─────────────────────────────────────────
 kite = KiteConnect(api_key=API_KEY)
-TOKEN_FILE = "kite_token.json"
+TOKEN_FILE = "kite_token.json"  # shared with NIFTY scripts — same session, same day
 
 def load_cached_token():
-    """Kite tokens are valid until ~6 AM the next day. Reuse today's token
-    instead of logging in again on every backtest run."""
     if not os.path.exists(TOKEN_FILE):
         return False
     try:
         with open(TOKEN_FILE, "r") as f:
             data = json.load(f)
         if data.get("date") != datetime.now().strftime("%Y-%m-%d"):
-            return False  # token is from a previous day — expired
+            return False
         kite.set_access_token(data["access_token"])
-        kite.profile()  # verify it actually still works
+        kite.profile()
         print("✅ Reused cached token from earlier today — no login needed\n")
         return True
     except Exception as e:
@@ -143,12 +127,9 @@ def save_cached_token(access_token):
         print(f"⚠️ Could not cache token: {e}")
 
 def auto_login():
-    """Auto-login using TOTP — no manual token needed."""
     try:
         print("🔐 Auto-login with TOTP...")
         sess = requests.Session()
-        # Realistic browser headers — bare 'python-requests' UA gets flagged by
-        # Zerodha's anti-bot checks, especially from new/datacenter IPs.
         sess.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                           "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -179,9 +160,8 @@ def auto_login():
             print(f"❌ TOTP failed: {data.get('message','Unknown error')}")
             return False
 
-        time.sleep(1)  # let the session fully register server-side before the redirect fetch
+        time.sleep(1)
 
-        # Kite redirects twice: /connect/login -> /connect/finish?sess_id=... -> <redirect_url>?request_token=...
         redirect_url = ""
         next_url = kite.login_url()
         for _ in range(3):
@@ -213,7 +193,6 @@ def auto_login():
         return False
 
 def manual_login():
-    """Fallback: manual token paste."""
     login_url = kite.login_url()
     print(f"\n🌐 Opening Zerodha login...")
     webbrowser.open(login_url)
@@ -230,7 +209,6 @@ def manual_login():
         return False
 
 def login():
-    """Reuse today's cached token if valid. Otherwise auto-login, fallback to manual."""
     if load_cached_token():
         return True
     if KITE_USER_ID and KITE_PASSWORD and KITE_TOTP_SECRET and \
@@ -242,27 +220,62 @@ def login():
 # ─────────────────────────────────────────
 #   DATA
 # ─────────────────────────────────────────
-def fetch_data(token, interval, days):
+def fetch_data(token, interval, days, label=""):
     to_dt   = datetime.now()
     from_dt = to_dt - timedelta(days=days)
     try:
         candles = kite.historical_data(token, from_dt, to_dt, interval)
-        if not candles: return None
+        if not candles:
+            print(f"  ⚠️ {label} Requested {from_dt.date()}→{to_dt.date()} ({days}d) but got ZERO candles back")
+            return None
         df = pd.DataFrame(candles)
         df.columns = ['date','Open','High','Low','Close','Volume']
         df.set_index('date', inplace=True)
         df.index = pd.to_datetime(df.index)
-        return df.dropna()
+        df = df.dropna()
+        actual_days = (df.index[-1].date() - df.index[0].date()).days
+        if actual_days < days - 10:  # meaningfully short of what we asked for
+            print(f"  ⚠️ {label} Requested {days}d ({from_dt.date()}→{to_dt.date()}) "
+                  f"but Kite only returned {actual_days}d ({df.index[0].date()}→{df.index[-1].date()}). "
+                  f"This is Kite's data, not a bug here — likely limited history for this token.")
+        return df
     except Exception as e:
-        print(f"  Fetch error: {e}")
+        print(f"  ❌ Fetch error ({label}): {e}")
         return None
 
-def find_nifty_fut_token():
+def find_sensex_token():
+    """Find SENSEX spot index instrument token dynamically (BSE) —
+    not hardcoded since it can differ/change, unlike NIFTY's well-known 256265."""
     try:
-        instruments = kite.instruments("NFO")
+        instruments = kite.instruments("BSE")
         df = pd.DataFrame(instruments)
-        nf = df[(df['name']=='NIFTY')&(df['instrument_type']=='FUT')&(df['segment']=='NFO-FUT')].copy()
-        if nf.empty: return None
+        idx = df[(df['tradingsymbol'] == 'SENSEX')]
+        if idx.empty:
+            print("❌ Could not find SENSEX in BSE instruments")
+            # Diagnostic: show anything close, to help debug naming mismatches
+            close = df[df['tradingsymbol'].astype(str).str.contains('SENSEX', case=False, na=False)]
+            if not close.empty:
+                print("  Found similar symbols instead:")
+                print(close[['tradingsymbol','instrument_token','segment','exchange']].to_string(index=False))
+            return None
+        row = idx.iloc[0]
+        token = int(row['instrument_token'])
+        print(f"  SENSEX token: {token} | segment={row.get('segment')} | exchange={row.get('exchange')} "
+              f"| name={row.get('name')}")
+        return token
+    except Exception as e:
+        print(f"  SENSEX token lookup error: {e}")
+        return None
+
+def find_sensex_fut_token():
+    """SENSEX futures live on BFO (BSE F&O), not NFO."""
+    try:
+        instruments = kite.instruments("BFO")
+        df = pd.DataFrame(instruments)
+        nf = df[(df['name']=='SENSEX') & (df['instrument_type']=='FUT')].copy()
+        if nf.empty:
+            print("  No SENSEX futures found on BFO")
+            return None
         nf['expiry'] = pd.to_datetime(nf['expiry'])
         future = nf[nf['expiry'].dt.date >= datetime.now().date()].sort_values('expiry')
         if future.empty: return None
@@ -274,7 +287,7 @@ def find_nifty_fut_token():
         return None
 
 # ─────────────────────────────────────────
-#   INDICATORS
+#   INDICATORS (identical to NIFTY)
 # ─────────────────────────────────────────
 def ema(s, p): return s.ewm(span=p, adjust=False).mean()
 
@@ -321,10 +334,8 @@ def calculate_atr(df, period=14):
 
 def estimate_premium_pts(entry_price, exit_price, signal, is_expiry_day):
     """Estimate option premium move (points) from the spot move using a
-    moneyness-aware delta (gamma) instead of a flat 0.5 — a weak/early move
-    has low delta (premium barely moves) while a strong breakout approaches
-    delta 1.0 (premium moves almost 1:1 with spot). Trapezoidal average of
-    entry delta (always 0.5, ATM) and exit delta over the path."""
+    moneyness-aware delta (gamma) instead of a flat 0.5 — see NIFTY backtest
+    for full rationale. Identical model, % scale auto-adapts to SENSEX."""
     spot_move = (exit_price-entry_price) if signal=="BUY" else (entry_price-exit_price)
     delta_scale_pts = entry_price * DELTA_SCALE_PCT
     delta_exit = DELTA_BASE + (1-DELTA_BASE)*np.tanh(spot_move/delta_scale_pts)
@@ -356,7 +367,7 @@ def get_orb_for_day(df, date):
     return float(orb['High'].max()),float(orb['Low'].min())
 
 # ─────────────────────────────────────────
-#   BACKTEST
+#   BACKTEST — identical logic to NIFTY, index-agnostic
 # ─────────────────────────────────────────
 def run_backtest(df5, df15, fut_vol):
     print("Preparing indicators...")
@@ -429,7 +440,7 @@ def run_backtest(df5, df15, fut_vol):
         trend15=row.get('Trend15',None)
 
         is_doji,bull_clean,bear_clean=analyze_candle(o,h,l,c)
-        expiry_safe=not is_expiry_day  # NIFTY weekly expiry — soft Tier2 factor + hard caution below
+        expiry_safe=not is_expiry_day
 
         if date not in orb_cache:
             orb_cache[date]=get_orb_for_day(df5,date)
@@ -442,14 +453,12 @@ def run_backtest(df5, df15, fut_vol):
         cross_up   = (pe9<=pe20 and ema9>ema20) or (ema9>ema20 and ema_gap > prev_gap > 0)
         cross_down = (pe9>=pe20 and ema9<ema20) or (ema9<ema20 and ema_gap < prev_gap < 0)
         if USE_BREAKOUT_CONFIRM:
-            # Breakout level = high/low TWO candles back; require both the
-            # breakout candle (prev) and this candle to hold beyond it.
             ref_high = float(df5.iloc[i-2]['High']); ref_low = float(df5.iloc[i-2]['Low'])
             prev_close = float(prev['Close'])
             breakout  = (price>ref_high+day_breakout_buffer) and (prev_close>ref_high+day_breakout_buffer)
             breakdown = (price<ref_low -day_breakout_buffer) and (prev_close<ref_low -day_breakout_buffer)
         else:
-            breakout  = price > ph + day_breakout_buffer   # extra buffer on expiry day filters fake pokes
+            breakout  = price > ph + day_breakout_buffer
             breakdown = price < pl - day_breakout_buffer
 
         buy_t1  = all([price>vwap, st==True,  cross_up,   vol_spike, breakout])
@@ -458,7 +467,6 @@ def run_backtest(df5, df15, fut_vol):
         if not buy_t1 and not sell_t1: continue
         if is_doji: continue
 
-        # S&R: Previous Day High/Low
         if date not in pdhl_cache:
             pdhl_cache[date] = get_prev_day_hl(df5, date)
         pdh, pdl = pdhl_cache[date]
@@ -469,7 +477,6 @@ def run_backtest(df5, df15, fut_vol):
 
         if buy_t1:
             if not (RSI_BUY_MIN<=rsi<=RSI_BUY_MAX): continue
-            # S&R: skip BUY if resistance (PDH) is closer than our target
             if pdh and 0 < (pdh - price) < tgt_dist: continue
             t2=sum([True, trend15==True, bull_clean, expiry_safe, orb_bull])
             if t2<day_ce_min_t2: continue
@@ -478,7 +485,6 @@ def run_backtest(df5, df15, fut_vol):
             conf="HIGH" if t2==5 else ("NORMAL" if t2>=3 else "WEAK")
         else:
             if not (RSI_SELL_MIN<=rsi<=RSI_SELL_MAX): continue
-            # S&R: skip SELL if support (PDL) is closer than our target
             if pdl and 0 < (price - pdl) < tgt_dist: continue
             t2=sum([True, trend15==False, bear_clean, expiry_safe, orb_bear])
             if t2<PE_MIN_T2: continue
@@ -519,21 +525,18 @@ def run_backtest(df5, df15, fut_vol):
             else:
                 max_favorable = max(max_favorable, price - fl)
 
-            # Early exit: no momentum = weak breakout (faster check on expiry day — theta burns fast)
             if j - i == day_momentum_candles and max_favorable < day_momentum_min:
                 fc=float(df5.iloc[j]['Close'])
                 exit_price=fc; outcome="WEAK"; break
 
-            # Step 1: Update breakeven (tighten SL if price went in our favor)
             if not breakeven_hit:
                 if signal=="BUY" and fh>=be_lvl:
                     current_sl=price; breakeven_hit=True
                 elif signal=="SELL" and fl<=be_lvl:
                     current_sl=price; breakeven_hit=True
 
-            # Step 1b: Trailing stop — once price extends well past breakeven,
-            # ratchet SL behind the peak instead of leaving it flat at breakeven
-            # (this is what catches the "+40 then back to BE" round-trip).
+            # Trailing stop — once price extends well past breakeven, ratchet
+            # SL behind the peak instead of leaving it flat at breakeven.
             if max_favorable >= trail_trigger_dist:
                 trail_dist = max_favorable - trail_step_dist
                 if signal=="BUY":
@@ -542,13 +545,11 @@ def run_backtest(df5, df15, fut_vol):
                     current_sl = min(current_sl, price - trail_dist)
                 breakeven_hit = True
 
-            # Step 2: Check TARGET FIRST (if price reached our target, take profit)
             if signal=="BUY" and fh>=target:
                 exit_price=target; outcome="TARGET"; break
             if signal=="SELL" and fl<=target:
                 exit_price=target; outcome="TARGET"; break
 
-            # Step 3: Check SL (only if target not hit on this candle)
             if signal=="BUY" and fl<=current_sl:
                 exit_price=current_sl
                 if current_sl>price: outcome="TRAIL"
@@ -619,7 +620,6 @@ def print_report(trades):
     swr=len(sdf[sdf['outcome'].isin(win_outcomes)])/len(sdf)*100 if len(sdf) else 0
     eod_pos=len(tdf[(tdf['outcome']=='EOD')&(tdf['pnl_rs']>0)])
 
-    # Confidence analysis
     high_df=tdf[tdf['confidence']=='HIGH']
     norm_df=tdf[tdf['confidence']=='NORMAL']
     high_wr=len(high_df[high_df['outcome'].isin(win_outcomes)])/len(high_df)*100 if len(high_df) else 0
@@ -628,8 +628,8 @@ def print_report(trades):
     days=len(set(tdf['date']))
     sep="="*65
     print(f"\n{sep}")
-    print(f"  NIFTY BACKTEST — Target ~{round(tdf['tgt_pts'].mean())}pts | SL ~{round(tdf['sl_pts'].mean())}pts")
-    print(f"  + Breakeven trailing | Trailing stop | EMA expanding gap")
+    print(f"  SENSEX BACKTEST — Target ~{round(tdf['tgt_pts'].mean())}pts | SL ~{round(tdf['sl_pts'].mean())}pts")
+    print(f"  Same proven NIFTY engine | Expiry: Thursday | Trailing stop")
     print(f"  Risk mode: {'ATR-DYNAMIC (experimental)' if USE_ATR_DYNAMIC else 'FIXED % (proven baseline)'}")
     print(f"  P&L mode: Estimated option premium (delta+theta model), LOT_SIZE={LOT_SIZE}")
     print(f"  Breakout mode: {'2-CANDLE CONFIRM (experimental)' if USE_BREAKOUT_CONFIRM else '1-CANDLE (proven baseline)'}")
@@ -640,7 +640,7 @@ def print_report(trades):
   Wins (Target+Trail): {wins} ({wr:.1f}%)  [Target: {targets}, Trail: {trails}]
   Losses (SL)     : {loss} ({loss/total*100:.1f}%)
   Breakeven       : {bes} ({bes/total*100:.1f}%)
-  Weak Exit       : {weaks} ({weaks/total*100:.1f}%)  ← no momentum after 15min
+  Weak Exit       : {weaks} ({weaks/total*100:.1f}%)
   EOD Exits       : {eods} ({eods/total*100:.1f}%)
     → Profitable  : {eod_pos}
     → Loss/Flat   : {eods-eod_pos}
@@ -666,7 +666,6 @@ def print_report(trades):
             dc=len(tdf[tdf['day']==d])
             print(f"  {e} {d:<12}: ₹{p:,.0f} ({dc} trades)")
 
-    # Max favorable analysis — shows how far price went in our favor before outcome
     if 'max_favorable' in tdf.columns:
         sl_trades = tdf[tdf['outcome']=='SL']
         if len(sl_trades) > 0:
@@ -703,7 +702,7 @@ def print_report(trades):
         print(f"  ⚠️  Stop after 3 consecutive losses")
 
     print(sep)
-    out_file = 'backtest_results_v5_atr.csv' if USE_ATR_DYNAMIC else 'backtest_results_v5.csv'
+    out_file = 'backtest_results_sensex_atr.csv' if USE_ATR_DYNAMIC else 'backtest_results_sensex.csv'
     tdf.to_csv(out_file,index=False)
     print(f"\n  📁 Saved → {out_file}")
     print(sep)
@@ -713,33 +712,41 @@ def print_report(trades):
 # ─────────────────────────────────────────
 def main():
     print("="*55)
-    print("  NIFTY BACKTESTER v5.0 — FINAL")
-    print("  CE(3/5) + PE(4/5) | 3 trades | 9:30-2:30 PM")
+    print("  SENSEX BACKTESTER v1.0 — proven NIFTY engine")
+    print("  CE(3/5) + PE(4/5) | 3 trades | 9:30-2:00 PM | Expiry: Thu")
     print("="*55)
 
     if not login(): return
 
+    print("📥 Finding SENSEX index token...")
+    SENSEX_TOKEN = find_sensex_token()
+    if not SENSEX_TOKEN:
+        print("❌ Could not find SENSEX token — aborting")
+        return
+
     DAYS = 100
-    print(f"📥 Fetching Nifty 5 min data ({DAYS} days)...")
-    df5=fetch_data(NIFTY_TOKEN,"5minute",days=DAYS)
+    print(f"📥 Fetching Sensex 5 min data ({DAYS} days)...")
+    df5=fetch_data(SENSEX_TOKEN,"5minute",days=DAYS,label="[5min spot]")
     if df5 is None or df5.empty:
         print("❌ Failed"); return
     print(f"✅ {len(df5)} candles | {df5.index[0].date()} to {df5.index[-1].date()}")
 
     print("📥 Fetching 15 min data...")
-    df15=fetch_data(NIFTY_TOKEN,"15minute",days=DAYS)
+    df15=fetch_data(SENSEX_TOKEN,"15minute",days=DAYS,label="[15min spot]")
     print(f"✅ {len(df15)} candles (15 min)" if df15 is not None else "⚠️ Not available")
 
-    print("📥 Finding Nifty Futures for volume...")
-    fut_token=find_nifty_fut_token()
+    print("📥 Finding Sensex Futures for volume...")
+    fut_token=find_sensex_fut_token()
     fut_vol=None
     if fut_token:
-        fut_vol=fetch_data(fut_token,"5minute",days=DAYS)
+        fut_vol=fetch_data(fut_token,"5minute",days=DAYS,label="[5min futures]")
         if fut_vol is not None and fut_vol['Volume'].sum()>0:
             print(f"✅ Futures volume: {len(fut_vol)} candles")
         else:
             print("⚠️ Futures volume empty")
             fut_vol=None
+    else:
+        print("⚠️ No futures token — backtest will use spot volume")
 
     print("\n🔍 Running backtest...")
     trades=run_backtest(df5,df15,fut_vol)

@@ -1,0 +1,18 @@
+[Unit]
+Description=Sensex Signal Bot (signal-only, no auto-execution)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/tradingsignalbot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -u /home/ubuntu/tradingsignalbot/sensex_zerodha_bot.py
+Restart=always
+RestartSec=15
+StandardOutput=append:/home/ubuntu/tradingsignalbot/sensex_bot.log
+StandardError=append:/home/ubuntu/tradingsignalbot/sensex_bot_error.log
+
+[Install]
+WantedBy=multi-user.target

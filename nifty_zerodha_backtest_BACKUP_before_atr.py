@@ -46,25 +46,6 @@ MOMENTUM_MIN = 5        # must be +5pts in favor, else exit early
 MAX_TRADES  = 3
 CAPITAL     = 100000
 STRIKE_GAP  = 50
-LOT_SIZE    = int(os.getenv("LOT_SIZE", 75))
-
-# ── OPTION PREMIUM ESTIMATE (replaces flat spot-% P&L) ──
-# Kite doesn't retain historical candles for expired weekly option contracts, so
-# real premium history isn't fetchable for a 60-100 day backtest. Instead, P&L is
-# estimated from the spot move using a moneyness-aware delta: an ATM option's
-# delta isn't a constant 0.5 — it rises toward ~1.0 as the trade moves further
-# in-the-money (gamma) and falls as it moves against us. This is exactly why a
-# 20pt spot move sometimes only moves the premium 6pts (weak/early move = low
-# delta) while a strong breakout moves it almost 1:1 (high delta). A theta
-# haircut also knocks down profits on expiry day, when time value erodes fastest.
-DELTA_BASE        = 0.5     # ATM delta at the moment of entry (moneyness = 0)
-DELTA_SCALE_PCT   = 0.0048  # spot move (% of price) for delta to approach ~0.85 (~120pts on NIFTY)
-EXPIRY_THETA_HAIRCUT_PCT = 0.15  # knock 15% off premium gains on expiry day
-
-# ── TRAILING STOP (locks in profit on big winners instead of round-tripping to BE) ──
-# Scales off the breakeven distance so it auto-adjusts for fixed-% vs ATR mode.
-TRAIL_TRIGGER_MULT = 1.5    # activates once favorable move >= 1.5x the breakeven distance
-TRAIL_STEP_MULT    = 0.6    # trailing SL follows this far (x breakeven distance) behind the peak
 
 RSI_BUY_MIN  = 48; RSI_BUY_MAX  = 63
 RSI_SELL_MIN = 37; RSI_SELL_MAX = 53
@@ -87,29 +68,6 @@ EXPIRY_CE_MIN_T2    = 4            # was 3 — need stronger confirmation on CE 
 EXPIRY_TRADE_END    = dtime(13, 0) # was 14:00 — stop new entries earlier, theta accelerates after
 EXPIRY_MOMENTUM_CANDLES = 2        # was 3 — check momentum after 10min not 15min, exit dead trades faster
 EXPIRY_BREAKOUT_BUFFER  = 3        # extra pts above prev high/below prev low — filters fake pokes, expiry day only
-
-# ── ATR-BASED DYNAMIC RISK (EXPERIMENTAL — A/B toggle, default OFF) ──
-# Fixed %-based SL/Target don't adapt to today's actual volatility. ATR-based
-# versions widen on volatile days, tighten on calm days. Multipliers below are
-# calibrated so that at a "typical" ATR(~30pts on NIFTY), this produces
-# almost the SAME distances as the current fixed values — so on average days
-# behavior is similar, but it adapts on unusually calm/volatile days.
-# Set True to test; compare results against this flag set False before keeping.
-USE_ATR_DYNAMIC   = False
-ATR_PERIOD        = 14
-SL_ATR_MULT       = 0.50    # ATR(30) × 0.50 ≈ 15pts, matches current SL
-TARGET_ATR_MULT   = 0.5635  # preserves current Target/SL ratio (1.127)
-BE_ATR_MULT       = 0.270   # preserves current Breakeven/SL ratio (0.54)
-MOMENTUM_ATR_MULT = 0.167   # ATR(30) × 0.167 ≈ 5pts, matches current momentum threshold
-BUFFER_ATR_MULT   = 0.10    # ATR(30) × 0.10 ≈ 3pts, matches current expiry breakout buffer
-
-# ── BREAKOUT CONFIRMATION (EXPERIMENTAL — A/B toggle, default OFF) ──
-# Current logic enters as soon as ONE candle closes above the prior candle's
-# high — a single-candle wick spike can trigger this and immediately reverse
-# (fake breakout). When True, requires the breakout level to hold for TWO
-# consecutive candles (the breakout candle + the next one) before entering —
-# entry shifts one candle later but should filter single-candle fakeouts.
-USE_BREAKOUT_CONFIRM = False
 
 # ─────────────────────────────────────────
 #   LOGIN (token cache + TOTP auto-login, matches bot exactly)
@@ -313,27 +271,6 @@ def calculate_rsi(s, p=14):
     d=s.diff(); g=d.where(d>0,0).rolling(p).mean(); l=(-d.where(d<0,0)).rolling(p).mean()
     return 100-(100/(1+g/l))
 
-def calculate_atr(df, period=14):
-    """Average True Range — used only when USE_ATR_DYNAMIC=True."""
-    tr = np.maximum(df['High']-df['Low'],
-         np.maximum(abs(df['High']-df['Close'].shift(1)), abs(df['Low']-df['Close'].shift(1))))
-    return tr.rolling(period).mean()
-
-def estimate_premium_pts(entry_price, exit_price, signal, is_expiry_day):
-    """Estimate option premium move (points) from the spot move using a
-    moneyness-aware delta (gamma) instead of a flat 0.5 — a weak/early move
-    has low delta (premium barely moves) while a strong breakout approaches
-    delta 1.0 (premium moves almost 1:1 with spot). Trapezoidal average of
-    entry delta (always 0.5, ATM) and exit delta over the path."""
-    spot_move = (exit_price-entry_price) if signal=="BUY" else (entry_price-exit_price)
-    delta_scale_pts = entry_price * DELTA_SCALE_PCT
-    delta_exit = DELTA_BASE + (1-DELTA_BASE)*np.tanh(spot_move/delta_scale_pts)
-    avg_delta = (DELTA_BASE+delta_exit)/2
-    premium_pts = spot_move*avg_delta
-    if is_expiry_day and premium_pts>0:
-        premium_pts *= (1-EXPIRY_THETA_HAIRCUT_PCT)
-    return premium_pts
-
 def analyze_candle(o,h,l,c):
     body=abs(c-o); tr=h-l
     if tr==0: return True,False,False
@@ -360,14 +297,12 @@ def get_orb_for_day(df, date):
 # ─────────────────────────────────────────
 def run_backtest(df5, df15, fut_vol):
     print("Preparing indicators...")
-    print(f"  ATR-based dynamic risk: {'ON' if USE_ATR_DYNAMIC else 'OFF (fixed %, proven baseline)'}")
     df5 = df5.copy()
     df5['EMA9']       = ema(df5['Close'],9)
     df5['EMA20']      = ema(df5['Close'],20)
     df5['VWAP']       = calculate_vwap(df5)
     df5['Supertrend'] = calculate_supertrend(df5)
     df5['RSI']        = calculate_rsi(df5['Close'])
-    df5['ATR14']      = calculate_atr(df5, ATR_PERIOD)
 
     if fut_vol is not None and fut_vol['Volume'].sum()>0:
         va = fut_vol['Volume'].reindex(df5.index, method='nearest', tolerance='5min')
@@ -391,7 +326,7 @@ def run_backtest(df5, df15, fut_vol):
     else:
         df5['Trend15']=None
 
-    df5=df5.dropna(subset=['EMA9','EMA20','VWAP','RSI','AvgVol','ATR14'])
+    df5=df5.dropna(subset=['EMA9','EMA20','VWAP','RSI','AvgVol'])
     days=len(set(df5.index.date))
     print(f"  Candles: {len(df5)} | Days: {days}\n")
 
@@ -401,18 +336,12 @@ def run_backtest(df5, df15, fut_vol):
         row=df5.iloc[i]; prev=df5.iloc[i-1]
         ts=df5.index[i]; date=ts.date(); t=ts.time()
 
-        atr = float(row['ATR14'])
-
         is_expiry_day = ts.weekday() == EXPIRY_WEEKDAY
         day_trade_end = EXPIRY_TRADE_END if is_expiry_day else TRADE_END
         day_vol_multi = EXPIRY_VOL_MULTI if is_expiry_day else VOL_MULTI
         day_ce_min_t2 = EXPIRY_CE_MIN_T2 if is_expiry_day else CE_MIN_T2
         day_momentum_candles = EXPIRY_MOMENTUM_CANDLES if is_expiry_day else MOMENTUM_CANDLES
-        if is_expiry_day:
-            day_breakout_buffer = (BUFFER_ATR_MULT * atr) if USE_ATR_DYNAMIC else EXPIRY_BREAKOUT_BUFFER
-        else:
-            day_breakout_buffer = 0
-        day_momentum_min = (MOMENTUM_ATR_MULT * atr) if USE_ATR_DYNAMIC else MOMENTUM_MIN
+        day_breakout_buffer = EXPIRY_BREAKOUT_BUFFER if is_expiry_day else 0
 
         if t<TRADE_START or t>day_trade_end: continue
         if daily_count.get(date,0)>=MAX_TRADES: continue
@@ -441,16 +370,8 @@ def run_backtest(df5, df15, fut_vol):
         ema_gap = ema9 - ema20; prev_gap = pe9 - pe20
         cross_up   = (pe9<=pe20 and ema9>ema20) or (ema9>ema20 and ema_gap > prev_gap > 0)
         cross_down = (pe9>=pe20 and ema9<ema20) or (ema9<ema20 and ema_gap < prev_gap < 0)
-        if USE_BREAKOUT_CONFIRM:
-            # Breakout level = high/low TWO candles back; require both the
-            # breakout candle (prev) and this candle to hold beyond it.
-            ref_high = float(df5.iloc[i-2]['High']); ref_low = float(df5.iloc[i-2]['Low'])
-            prev_close = float(prev['Close'])
-            breakout  = (price>ref_high+day_breakout_buffer) and (prev_close>ref_high+day_breakout_buffer)
-            breakdown = (price<ref_low -day_breakout_buffer) and (prev_close<ref_low -day_breakout_buffer)
-        else:
-            breakout  = price > ph + day_breakout_buffer   # extra buffer on expiry day filters fake pokes
-            breakdown = price < pl - day_breakout_buffer
+        breakout  = price > ph + day_breakout_buffer   # extra buffer on expiry day filters fake pokes
+        breakdown = price < pl - day_breakout_buffer
 
         buy_t1  = all([price>vwap, st==True,  cross_up,   vol_spike, breakout])
         sell_t1 = all([price<vwap, st==False, cross_down, vol_spike, breakdown])
@@ -463,13 +384,10 @@ def run_backtest(df5, df15, fut_vol):
             pdhl_cache[date] = get_prev_day_hl(df5, date)
         pdh, pdl = pdhl_cache[date]
 
-        # Target distance — must match whichever mode (ATR or fixed%) is active,
-        # so the S&R filter checks against the SAME distance we'll actually use.
-        tgt_dist = (TARGET_ATR_MULT * atr) if USE_ATR_DYNAMIC else (price * TARGET_PCT)
-
         if buy_t1:
             if not (RSI_BUY_MIN<=rsi<=RSI_BUY_MAX): continue
             # S&R: skip BUY if resistance (PDH) is closer than our target
+            tgt_dist = price * TARGET_PCT
             if pdh and 0 < (pdh - price) < tgt_dist: continue
             t2=sum([True, trend15==True, bull_clean, expiry_safe, orb_bull])
             if t2<day_ce_min_t2: continue
@@ -479,6 +397,7 @@ def run_backtest(df5, df15, fut_vol):
         else:
             if not (RSI_SELL_MIN<=rsi<=RSI_SELL_MAX): continue
             # S&R: skip SELL if support (PDL) is closer than our target
+            tgt_dist = price * TARGET_PCT
             if pdl and 0 < (price - pdl) < tgt_dist: continue
             t2=sum([True, trend15==False, bear_clean, expiry_safe, orb_bear])
             if t2<PE_MIN_T2: continue
@@ -486,23 +405,12 @@ def run_backtest(df5, df15, fut_vol):
             signal="SELL"
             conf="HIGH" if t2==5 else ("NORMAL" if t2>=4 else "WEAK")
 
-        if USE_ATR_DYNAMIC:
-            sl_dist = SL_ATR_MULT * atr
-            be_dist = BE_ATR_MULT * atr
-        else:
-            sl_dist = price * SL_PCT
-            be_dist = price * BREAKEVEN_PCT
-        # tgt_dist already computed above (shared with the S&R filter check)
-
-        sl     = price - sl_dist if signal=="BUY" else price + sl_dist
-        target = price + tgt_dist if signal=="BUY" else price - tgt_dist
-        be_lvl = price + be_dist if signal=="BUY" else price - be_dist
+        sl     = price*(1-SL_PCT)     if signal=="BUY" else price*(1+SL_PCT)
+        target = price*(1+TARGET_PCT) if signal=="BUY" else price*(1-TARGET_PCT)
+        be_lvl = price*(1+BREAKEVEN_PCT) if signal=="BUY" else price*(1-BREAKEVEN_PCT)
 
         sl_pts  = round(abs(price - sl), 1)
         tgt_pts = round(abs(target - price), 1)
-
-        trail_trigger_dist = be_dist * TRAIL_TRIGGER_MULT
-        trail_step_dist    = be_dist * TRAIL_STEP_MULT
 
         current_sl = sl; outcome="EOD"; exit_price=price
         breakeven_hit = False; max_favorable = 0
@@ -520,7 +428,7 @@ def run_backtest(df5, df15, fut_vol):
                 max_favorable = max(max_favorable, price - fl)
 
             # Early exit: no momentum = weak breakout (faster check on expiry day — theta burns fast)
-            if j - i == day_momentum_candles and max_favorable < day_momentum_min:
+            if j - i == day_momentum_candles and max_favorable < MOMENTUM_MIN:
                 fc=float(df5.iloc[j]['Close'])
                 exit_price=fc; outcome="WEAK"; break
 
@@ -531,17 +439,6 @@ def run_backtest(df5, df15, fut_vol):
                 elif signal=="SELL" and fl<=be_lvl:
                     current_sl=price; breakeven_hit=True
 
-            # Step 1b: Trailing stop — once price extends well past breakeven,
-            # ratchet SL behind the peak instead of leaving it flat at breakeven
-            # (this is what catches the "+40 then back to BE" round-trip).
-            if max_favorable >= trail_trigger_dist:
-                trail_dist = max_favorable - trail_step_dist
-                if signal=="BUY":
-                    current_sl = max(current_sl, price + trail_dist)
-                else:
-                    current_sl = min(current_sl, price - trail_dist)
-                breakeven_hit = True
-
             # Step 2: Check TARGET FIRST (if price reached our target, take profit)
             if signal=="BUY" and fh>=target:
                 exit_price=target; outcome="TARGET"; break
@@ -551,20 +448,12 @@ def run_backtest(df5, df15, fut_vol):
             # Step 3: Check SL (only if target not hit on this candle)
             if signal=="BUY" and fl<=current_sl:
                 exit_price=current_sl
-                if current_sl>price: outcome="TRAIL"
-                elif breakeven_hit: outcome="BE"
-                else: outcome="SL"
-                break
+                outcome="BE" if breakeven_hit else "SL"; break
             if signal=="SELL" and fh>=current_sl:
                 exit_price=current_sl
-                if current_sl<price: outcome="TRAIL"
-                elif breakeven_hit: outcome="BE"
-                else: outcome="SL"
-                break
+                outcome="BE" if breakeven_hit else "SL"; break
 
         pnl_pct=(exit_price-price)/price if signal=="BUY" else (price-exit_price)/price
-        premium_pts = estimate_premium_pts(price, exit_price, signal, is_expiry_day)
-        pnl_rs = round(premium_pts*LOT_SIZE, 0)
 
         trades.append({
             "date":str(date),"time":t.strftime("%H:%M"),
@@ -573,8 +462,7 @@ def run_backtest(df5, df15, fut_vol):
             "sl_pts":sl_pts,"tgt_pts":tgt_pts,
             "exit":round(exit_price,2),"outcome":outcome,
             "max_favorable":round(max_favorable,1),
-            "pnl_pct":round(pnl_pct*100,2),
-            "premium_pts":round(premium_pts,1),"pnl_rs":pnl_rs,
+            "pnl_pct":round(pnl_pct*100,2),"pnl_rs":round(CAPITAL*pnl_pct,0),
             "rsi":round(rsi,1),
             "ema9":round(ema9,1),"ema20":round(ema20,1),
             "vwap":round(vwap,1),"supertrend":"Green" if st else "Red",
@@ -596,48 +484,42 @@ def print_report(trades):
 
     tdf=pd.DataFrame(trades)
     total=len(tdf)
-    win_outcomes=['TARGET','TRAIL']
-    wins=len(tdf[tdf['outcome'].isin(win_outcomes)])
-    trails=len(tdf[tdf['outcome']=='TRAIL'])
-    targets=len(tdf[tdf['outcome']=='TARGET'])
+    wins=len(tdf[tdf['outcome']=='TARGET'])
     loss=len(tdf[tdf['outcome']=='SL'])
     bes=len(tdf[tdf['outcome']=='BE'])
     weaks=len(tdf[tdf['outcome']=='WEAK'])
     eods=len(tdf[tdf['outcome']=='EOD'])
     wr=wins/total*100; net=tdf['pnl_rs'].sum()
-    aw=tdf[tdf['outcome'].isin(win_outcomes)]['pnl_rs'].mean() if wins>0 else 0
+    aw=tdf[tdf['outcome']=='TARGET']['pnl_rs'].mean() if wins>0 else 0
     al=tdf[tdf['outcome']=='SL']['pnl_rs'].mean() if loss>0 else 0
 
     mws=mls=cw=cl=0
     for o in tdf['outcome']:
-        if o in win_outcomes: cw+=1;cl=0;mws=max(mws,cw)
-        elif o=='SL':         cl+=1;cw=0;mls=max(mls,cl)
-        else:                 cw=0;cl=0
+        if o=='TARGET': cw+=1;cl=0;mws=max(mws,cw)
+        elif o=='SL':   cl+=1;cw=0;mls=max(mls,cl)
+        else:           cw=0;cl=0
 
     bdf=tdf[tdf['signal']=='BUY']; sdf=tdf[tdf['signal']=='SELL']
-    bwr=len(bdf[bdf['outcome'].isin(win_outcomes)])/len(bdf)*100 if len(bdf) else 0
-    swr=len(sdf[sdf['outcome'].isin(win_outcomes)])/len(sdf)*100 if len(sdf) else 0
+    bwr=len(bdf[bdf['outcome']=='TARGET'])/len(bdf)*100 if len(bdf) else 0
+    swr=len(sdf[sdf['outcome']=='TARGET'])/len(sdf)*100 if len(sdf) else 0
     eod_pos=len(tdf[(tdf['outcome']=='EOD')&(tdf['pnl_rs']>0)])
 
     # Confidence analysis
     high_df=tdf[tdf['confidence']=='HIGH']
     norm_df=tdf[tdf['confidence']=='NORMAL']
-    high_wr=len(high_df[high_df['outcome'].isin(win_outcomes)])/len(high_df)*100 if len(high_df) else 0
-    norm_wr=len(norm_df[norm_df['outcome'].isin(win_outcomes)])/len(norm_df)*100 if len(norm_df) else 0
+    high_wr=len(high_df[high_df['outcome']=='TARGET'])/len(high_df)*100 if len(high_df) else 0
+    norm_wr=len(norm_df[norm_df['outcome']=='TARGET'])/len(norm_df)*100 if len(norm_df) else 0
 
     days=len(set(tdf['date']))
     sep="="*65
     print(f"\n{sep}")
     print(f"  NIFTY BACKTEST — Target ~{round(tdf['tgt_pts'].mean())}pts | SL ~{round(tdf['sl_pts'].mean())}pts")
-    print(f"  + Breakeven trailing | Trailing stop | EMA expanding gap")
-    print(f"  Risk mode: {'ATR-DYNAMIC (experimental)' if USE_ATR_DYNAMIC else 'FIXED % (proven baseline)'}")
-    print(f"  P&L mode: Estimated option premium (delta+theta model), LOT_SIZE={LOT_SIZE}")
-    print(f"  Breakout mode: {'2-CANDLE CONFIRM (experimental)' if USE_BREAKOUT_CONFIRM else '1-CANDLE (proven baseline)'}")
+    print(f"  + Breakeven trailing | EMA expanding gap")
     print(sep)
     print(f"""
 📊 OVERALL:
   Total Trades    : {total} over {days} days ({total/days:.1f}/day)
-  Wins (Target+Trail): {wins} ({wr:.1f}%)  [Target: {targets}, Trail: {trails}]
+  Wins (Target)   : {wins} ({wr:.1f}%)
   Losses (SL)     : {loss} ({loss/total*100:.1f}%)
   Breakeven       : {bes} ({bes/total*100:.1f}%)
   Weak Exit       : {weaks} ({weaks/total*100:.1f}%)  ← no momentum after 15min
@@ -679,7 +561,7 @@ def print_report(trades):
     print(f"{'Date':<12}{'Time':<7}{'Sig':<6}{'Conf':<7}{'Entry':<10}{'SL':<6}{'TGT':<6}{'Exit':<10}{'MaxFav':<8}{'PnL₹':<8}{'Result':<6}{'RSI':<6}VolR")
     print("-"*100)
     for _,r in tdf.iterrows():
-        icon="✅" if r['outcome']=='TARGET' else ("🔒" if r['outcome']=='TRAIL' else ("❌" if r['outcome']=='SL' else ("⚖️" if r['outcome']=='BE' else ("⚠️" if r['outcome']=='WEAK' else "➡️"))))
+        icon="✅" if r['outcome']=='TARGET' else ("❌" if r['outcome']=='SL' else ("⚖️" if r['outcome']=='BE' else ("⚠️" if r['outcome']=='WEAK' else "➡️")))
         print(f"{r['date']:<12}{r['time']:<7}{r['signal']:<6}{r['confidence']:<7}"
               f"{r['entry']:<10}{r['sl_pts']:<6}{r['tgt_pts']:<6}{r['exit']:<10}"
               f"+{r['max_favorable']:<7}{r['pnl_rs']:<8}"
@@ -703,9 +585,8 @@ def print_report(trades):
         print(f"  ⚠️  Stop after 3 consecutive losses")
 
     print(sep)
-    out_file = 'backtest_results_v5_atr.csv' if USE_ATR_DYNAMIC else 'backtest_results_v5.csv'
-    tdf.to_csv(out_file,index=False)
-    print(f"\n  📁 Saved → {out_file}")
+    tdf.to_csv('backtest_results_v5.csv',index=False)
+    print(f"\n  📁 Saved → backtest_results_v5.csv")
     print(sep)
 
 # ─────────────────────────────────────────

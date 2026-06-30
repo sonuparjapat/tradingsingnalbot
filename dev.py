@@ -13,8 +13,11 @@ import os
 from pathlib import Path
 
 SCRIPTS = {
-    'bot':      'nifty_zerodha_bot.py',
-    'backtest': 'nifty_zerodha_backtest.py',
+    'bot':              'nifty_zerodha_bot.py',
+    'backtest':         'nifty_zerodha_backtest.py',
+    'sensex_bot':       'sensex_zerodha_bot.py',
+    'sensex_backtest':  'sensex_zerodha_backtest.py',
+    'morning_scanner':  'nifty_morning_scanner.py',
 }
 
 WATCH_EXTENSIONS = {'.py'}
@@ -100,20 +103,47 @@ def run_once(script_path):
     sys.exit(result.returncode)
 
 
+def run_both_bots():
+    """Start both live bots (NIFTY + SENSEX) together, no auto-restart-on-change.
+    Use for local testing of both signal streams at once. Ctrl+C stops both."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    print("\n▶️ [dev] Starting BOTH bots (nifty_zerodha_bot.py + sensex_zerodha_bot.py)...")
+    print("   Press Ctrl+C to stop both\n")
+    procs = [
+        subprocess.Popen([sys.executable, SCRIPTS['bot']], cwd=base_dir),
+        subprocess.Popen([sys.executable, SCRIPTS['sensex_bot']], cwd=base_dir),
+    ]
+    try:
+        for p in procs:
+            p.wait()
+    except KeyboardInterrupt:
+        print("\n⛔ [dev] Stopping both bots...")
+        for p in procs:
+            p.terminate()
+        for p in procs:
+            try: p.wait(timeout=5)
+            except subprocess.TimeoutExpired: p.kill()
+
+
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ('-h', '--help'):
         print(__doc__)
         print("Available scripts:")
         for name, path in SCRIPTS.items():
             print(f"  {name:<12} → {path}")
+        print(f"  {'both':<12} → nifty_zerodha_bot.py + sensex_zerodha_bot.py together")
         sys.exit(0)
 
     script_name = sys.argv[1]
     no_watch = '--no-watch' in sys.argv
 
+    if script_name == 'both':
+        run_both_bots()
+        return
+
     if script_name not in SCRIPTS:
         print(f"❌ Unknown script: '{script_name}'")
-        print(f"   Available: {', '.join(SCRIPTS.keys())}")
+        print(f"   Available: {', '.join(SCRIPTS.keys())}, both")
         sys.exit(1)
 
     script_path = SCRIPTS[script_name]
