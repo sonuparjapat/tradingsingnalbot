@@ -1,22 +1,15 @@
 """
 =============================================================
-NIFTY MORNING SCANNER — RELAXED FILTERS, SIGNAL-ONLY
+NIFTY MORNING SCANNER — CE-only ATM, with AUTO EXECUTION
 =============================================================
-The main nifty_zerodha_bot.py runs the full, proven Tier1(5/5)+Tier2(3-4/5)
-+S&R+expiry-caution rule set all day, and can auto-execute. This is a SEPARATE,
-ADDITIONAL tool — it does NOT replace or touch the main bot.
+Scans the 9:30-11:00 AM window for high-quality CE (BUY) signals.
+Strategy: VWAP + Supertrend + Breakout + Bull clean candle (4 conditions).
+Backtest (60d): 81% win rate, 2 SL only — best morning strategy tested.
 
-Observation: 9:30-11:00 AM tends to have strong, clean directional moves that
-the full filter stack sometimes screens out (volume-spike threshold, RSI band,
-Tier2 minimum score, S&R proximity, ORB requirement). This scanner drops those
-secondary/confirmation filters and keeps only the MANDATORY core signal:
-
-  Price vs VWAP + Supertrend direction + EMA9/20 momentum + Breakout/breakdown
-
-...restricted to the 9:30-11:00 window only. It NEVER places real orders —
-there is no AUTO_ARMED, no GTT, no position tracking, no execution code path
-at all. It only sends Telegram alerts, clearly labeled as relaxed/exploratory,
-so you can judge and act on them manually.
+SIGNAL-ONLY by default — starts disarmed. Send /start_auto on Telegram
+to arm real order execution. Send /stop_auto to disarm. One position at a time.
+GTT OCO set for SL+Target on every entry. Breakeven and trailing stop auto-managed.
+Position persists across restarts via morning_position_state.json.
 =============================================================
 """
 
@@ -61,6 +54,21 @@ MAX_ALERTS     = 6
 HEARTBEAT_MINS = 20
 
 EXPIRY_WEEKDAY = 1  # Tuesday — no morning signals on expiry day
+
+# Auto-execution parameters (same as main bot + backtest)
+LOT_SIZE     = int(os.getenv("LOT_SIZE", "75"))
+OPTION_DELTA = 0.5    # ATM delta approx — converts spot pts to premium pts
+MOMENTUM_MIN = 5      # weak-exit threshold: if <5 pts after 15 min → exit
+HARD_EXIT    = dtime(15, 10)
+
+TRAIL_TRIGGER_MULT = 1.5
+TRAIL_STEP_MULT    = 0.6
+
+POSITION_FILE = "morning_position_state.json"
+
+# ─── AUTO-TRADING STATE (in-memory — resets to OFF on every restart) ───
+AUTO_ARMED = False
+position   = None   # dict of open position or None
 
 telegram_offset   = 0
 backtest_running  = False
@@ -285,7 +293,7 @@ def run_remote_evening_backtest(days):
         msg = (
             f"📊 <b>EVENING BACKTEST {days}d</b> [TIGHT MODE]\n\n"
             f"Window: 13:00-14:30 | PE/SELL only\n"
-            f"6 conditions: VWAP + ST + 15min bearish + Breakdown + Clean + RSI(35-55)\n"
+            f"7 conditions: VWAP + ST + 5min EMA bearish + 15min bearish + Breakdown + Clean + RSI(38-52)\n"
             f"Period: {tdf['date'].iloc[0]} → {tdf['date'].iloc[-1]}\n"
             f"Days with signals: {days_w}\n\n"
             f"<b>Total Signals: {total}</b>\n"
@@ -308,7 +316,7 @@ def run_remote_evening_backtest(days):
 
 
 def process_telegram_commands():
-    global backtest_running
+    global backtest_running, AUTO_ARMED
     updates = get_telegram_updates()
     for u in updates:
         msg = u.get("message", {})
@@ -316,25 +324,80 @@ def process_telegram_commands():
         chat_id = str(msg.get("chat", {}).get("id", ""))
         if chat_id != str(CHAT_ID):
             continue
-        if text == "/morning_status":
+
+        if text == "/start_auto":
+            AUTO_ARMED = True
+            print("🟢 MORNING AUTO-TRADING ARMED via Telegram")
+            send_telegram(
+                "✅ <b>MORNING AUTO-TRADING ARMED</b> 🟢\n\n"
+                "Bot will now place REAL orders when a BUY CE signal fires.\n"
+                f"Strategy: VWAP + Supertrend + Breakout + Clean candle\n"
+                f"Lot size: {LOT_SIZE} | One position at a time.\n"
+                f"GTT OCO: SL + Target set automatically on entry.\n"
+                f"Breakeven & trailing stop managed automatically.\n\n"
+                "Send /stop_auto to disarm."
+            )
+        elif text == "/stop_auto":
+            AUTO_ARMED = False
+            print("🔴 MORNING AUTO-TRADING DISARMED via Telegram")
+            send_telegram(
+                "⛔ <b>MORNING AUTO-TRADING DISARMED</b>\n\n"
+                "No new orders will be placed. Existing position (if any) continues monitoring.\n"
+                "Send /square_off to close any open position manually."
+            )
+        elif text == "/status":
+            armed_state = "🟢 ARMED — placing real orders" if AUTO_ARMED else "🔴 DISARMED — signal-only"
+            if position:
+                spot_move = (float(kite.quote([f"NFO:{position['symbol']}"])
+                             .get(f"NFO:{position['symbol']}", {}).get('last_price', position['entry_premium']))
+                             - position['entry_premium']) if True else 0
+                pos_info = (
+                    f"\n\n📦 <b>Open Position:</b>\n"
+                    f"{position['signal']} {position['symbol']}\n"
+                    f"Qty: {position['qty']} | Entry: {position['entry_premium']}\n"
+                    f"SL: {position['sl_premium']} | Target: {position['target_premium']}\n"
+                    f"Breakeven: {'✅ Hit' if position['breakeven_hit'] else '⏳ Not yet'}\n"
+                    f"Trailing: {'🔒 Active' if position.get('trail_active') else 'Not yet'}\n"
+                    f"Peak move: +{position.get('peak_favorable', 0):.1f} pts"
+                )
+            else:
+                pos_info = "\n\nNo open position."
+            send_telegram(
+                f"📊 <b>Morning Scanner Status</b>\n\n"
+                f"Auto-trade: {armed_state}\n"
+                f"Window: {MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')}\n"
+                f"Strategy: CE (BUY) only | 4 conditions | ATM\n"
+                f"Backtest: 81% win rate, 2 SL/60d{pos_info}"
+            )
+        elif text == "/square_off":
+            if position:
+                send_telegram(f"🔴 Manual square-off requested for {position['symbol']}...")
+                exit_position("MANUAL")
+            else:
+                send_telegram("ℹ️ No open morning position to square off.")
+
+        elif text == "/morning_status":
+            armed_state = "🟢 ARMED" if AUTO_ARMED else "🔴 DISARMED (signal-only)"
             send_telegram(
                 "📊 <b>Morning Scanner Status</b>\n\n"
-                "🔵 SIGNAL-ONLY — never places real orders\n"
-                f"🌅 Active window: {MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')}\n"
+                f"Auto-trade: {armed_state}\n"
+                f"🌅 Window: {MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')}\n"
                 "Strategy: <b>CE (BUY) only — ATM, 4 conditions</b>\n"
                 "  VWAP + Supertrend + Breakout + Clean candle\n\n"
-                "Backtest (60d): 81% win rate, 2 SL, Rs3,436/month\n"
-                "PE tested: 47% win rate → not viable in morning"
+                "Backtest (60d): 81% win rate, 2 SL\n"
+                "Send /start_auto to arm | /stop_auto to disarm"
             )
         elif text == "/morning_help":
             send_telegram(
                 "🤖 <b>Morning Scanner Commands</b>\n\n"
-                "🔵 CE-only strategy, signal-only — never trades.\n"
-                "4 conditions: VWAP + Supertrend + Breakout + Clean candle\n"
-                "ATM options (CE only) — PE = 47% win in backtest, not viable\n\n"
-                "/morning_status — confirm it's running\n"
-                "/backtest [days] — backtest morning signals (default 60, max 100)\n"
-                "/backtest_evening [days] — backtest evening signals\n"
+                "CE-only ATM strategy | 4 conditions | 81% win rate (60d backtest)\n\n"
+                "/start_auto — arm real order execution\n"
+                "/stop_auto — disarm (no new entries)\n"
+                "/status — show armed state + open position\n"
+                "/square_off — emergency close open position\n"
+                "/morning_status — scanner status\n"
+                "/backtest [days] — morning backtest (default 60)\n"
+                "/backtest_evening [days] — evening backtest\n"
                 "/morning_help — this message"
             )
         elif text == "/backtest" or text.startswith("/backtest "):
@@ -439,6 +502,304 @@ def get_strike(price, signal):
     if signal == "BUY": return f"{atm} CE"
     else: return f"{atm} PE"
 
+# ─── ORDER EXECUTION (only runs when AUTO_ARMED == True) ───
+def find_option_symbol(price, signal):
+    """Find ATM CE tradingsymbol for the nearest weekly expiry."""
+    try:
+        atm = round(price / STRIKE_GAP) * STRIKE_GAP
+        opt_type = "CE" if signal == "BUY" else "PE"
+        instruments = kite.instruments("NFO")
+        df = pd.DataFrame(instruments)
+        opts = df[(df['name'] == 'NIFTY') & (df['instrument_type'] == opt_type) &
+                  (df['strike'] == atm)].copy()
+        if opts.empty: return None
+        opts['expiry'] = pd.to_datetime(opts['expiry'])
+        today = datetime.now().date()
+        opts = opts[opts['expiry'].dt.date >= today].sort_values('expiry')
+        if opts.empty: return None
+        return opts.iloc[0]['tradingsymbol']
+    except Exception as e:
+        print(f"❌ Symbol lookup error: {e}")
+        return None
+
+def check_sufficient_funds(estimated_premium, qty):
+    try:
+        margins = kite.margins()
+        available_cash = margins["equity"]["available"]["live_balance"]
+        required = estimated_premium * qty
+        buffer = required * 0.05
+        sufficient = available_cash >= (required + buffer)
+        return sufficient, available_cash, required
+    except Exception as e:
+        print(f"⚠️ Margin check failed: {e}")
+        return False, 0, 0
+
+def place_entry_order(symbol, qty):
+    try:
+        order_id = kite.place_order(
+            variety=kite.VARIETY_REGULAR, exchange=kite.EXCHANGE_NFO,
+            tradingsymbol=symbol, transaction_type=kite.TRANSACTION_TYPE_BUY,
+            quantity=qty, product=kite.PRODUCT_MIS, order_type=kite.ORDER_TYPE_MARKET
+        )
+        return order_id
+    except Exception as e:
+        print(f"❌ Entry order failed: {e}")
+        send_telegram(f"❌ <b>ENTRY ORDER FAILED</b>\n{symbol}\n{e}")
+        return None
+
+def get_order_avg_price(order_id, timeout=15):
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            history = kite.order_history(order_id)
+            last = history[-1]
+            if last['status'] == 'COMPLETE':
+                return float(last['average_price'])
+            elif last['status'] in ('REJECTED', 'CANCELLED'):
+                print(f"  Order {order_id} {last['status']}: {last.get('status_message','')}")
+                send_telegram(f"❌ Entry order {last['status']}: {last.get('status_message','')}")
+                return None
+        except Exception as e:
+            print(f"  Order status check error: {e}")
+        time.sleep(1)
+    return None
+
+def place_exit_order(symbol, qty):
+    try:
+        order_id = kite.place_order(
+            variety=kite.VARIETY_REGULAR, exchange=kite.EXCHANGE_NFO,
+            tradingsymbol=symbol, transaction_type=kite.TRANSACTION_TYPE_SELL,
+            quantity=qty, product=kite.PRODUCT_MIS, order_type=kite.ORDER_TYPE_MARKET
+        )
+        return order_id
+    except Exception as e:
+        print(f"❌ Exit order failed: {e}")
+        send_telegram(f"❌ <b>EXIT ORDER FAILED — CLOSE {symbol} MANUALLY NOW</b>\n{e}")
+        return None
+
+def place_gtt_oco(symbol, qty, sl_premium, target_premium, last_price):
+    try:
+        gtt = kite.place_gtt(
+            trigger_type=kite.GTT_TYPE_OCO, tradingsymbol=symbol, exchange=kite.EXCHANGE_NFO,
+            trigger_values=[sl_premium, target_premium], last_price=last_price,
+            orders=[
+                {"transaction_type": kite.TRANSACTION_TYPE_SELL, "quantity": qty,
+                 "order_type": kite.ORDER_TYPE_LIMIT, "product": kite.PRODUCT_MIS, "price": sl_premium},
+                {"transaction_type": kite.TRANSACTION_TYPE_SELL, "quantity": qty,
+                 "order_type": kite.ORDER_TYPE_LIMIT, "product": kite.PRODUCT_MIS, "price": target_premium},
+            ]
+        )
+        return gtt["trigger_id"]
+    except Exception as e:
+        print(f"❌ GTT placement failed: {e}")
+        send_telegram(f"⚠️ <b>GTT FAILED — manage SL/Target manually for {symbol}!</b>\n{e}")
+        return None
+
+def modify_gtt_sl(gtt_id, symbol, qty, new_sl, target_premium, last_price):
+    try:
+        kite.modify_gtt(
+            trigger_id=gtt_id, trigger_type=kite.GTT_TYPE_OCO,
+            tradingsymbol=symbol, exchange=kite.EXCHANGE_NFO,
+            trigger_values=[new_sl, target_premium], last_price=last_price,
+            orders=[
+                {"transaction_type": kite.TRANSACTION_TYPE_SELL, "quantity": qty,
+                 "order_type": kite.ORDER_TYPE_LIMIT, "product": kite.PRODUCT_MIS, "price": new_sl},
+                {"transaction_type": kite.TRANSACTION_TYPE_SELL, "quantity": qty,
+                 "order_type": kite.ORDER_TYPE_LIMIT, "product": kite.PRODUCT_MIS, "price": target_premium},
+            ]
+        )
+        return True
+    except Exception as e:
+        print(f"⚠️ GTT modify failed: {e}")
+        return False
+
+def cancel_gtt(gtt_id):
+    try:
+        kite.delete_gtt(gtt_id)
+        return True
+    except Exception as e:
+        print(f"⚠️ GTT cancel failed: {e}")
+        return False
+
+def check_gtt_triggered():
+    """Detect if our GTT was fired externally (SL or target hit by Zerodha). Clears position."""
+    global position
+    if position is None or not position.get("gtt_id"):
+        return
+    try:
+        gtts = kite.get_gtts()
+        active_ids = {g['id'] for g in gtts if g['status'] in ('active', 'triggered')}
+        if position["gtt_id"] not in active_ids:
+            send_telegram(
+                f"✅ <b>POSITION CLOSED (GTT triggered)</b>\n\n"
+                f"{position['symbol']}\nSL or Target hit — Zerodha closed the position.\n"
+                f"Check Kite for final P&L."
+            )
+            position = None
+            save_position_state()
+    except Exception as e:
+        print(f"GTT status check error: {e}")
+
+def save_position_state():
+    global position
+    if position is None:
+        if os.path.exists(POSITION_FILE):
+            try: os.remove(POSITION_FILE)
+            except Exception as e: print(f"⚠️ Could not remove position file: {e}")
+        return
+    try:
+        data = position.copy()
+        data["entry_time"] = data["entry_time"].isoformat()
+        with open(POSITION_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"⚠️ Could not save position state: {e}")
+
+def load_position_state():
+    global position
+    if not os.path.exists(POSITION_FILE):
+        return
+    try:
+        with open(POSITION_FILE, "r") as f:
+            data = json.load(f)
+        data["entry_time"] = datetime.fromisoformat(data["entry_time"])
+        position = data
+        print(f"🔄 Recovered open position: {position['symbol']}")
+        send_telegram(
+            f"🔄 <b>MORNING POSITION RECOVERED AFTER RESTART</b>\n\n"
+            f"{position['symbol']}\nEntry: {position['entry_premium']}\n"
+            f"SL: {position['sl_premium']} | Target: {position['target_premium']}\n"
+            f"Breakeven hit: {'Yes' if position['breakeven_hit'] else 'No'}\n\n"
+            f"Resuming monitoring. GTT was untouched while bot was down."
+        )
+    except Exception as e:
+        print(f"⚠️ Could not load position state: {e}")
+        send_telegram(f"⚠️ <b>Found a saved morning position but couldn't load it!</b>\n{e}\n\nCheck Kite manually.")
+
+def execute_entry(signal, price):
+    """Place a real BUY CE order. Called only when AUTO_ARMED and position is None."""
+    global position
+    symbol = find_option_symbol(price, signal)
+    if not symbol:
+        send_telegram(f"❌ Could not find ATM CE symbol — auto-entry skipped")
+        return
+
+    try:
+        quote = kite.quote([f"NFO:{symbol}"])
+        ltp = quote[f"NFO:{symbol}"]["last_price"]
+    except Exception as e:
+        send_telegram(f"❌ Could not fetch LTP for {symbol} — auto-entry skipped\n{e}")
+        return
+
+    has_funds, available, required = check_sufficient_funds(ltp, LOT_SIZE)
+    if not has_funds:
+        send_telegram(
+            f"❌ <b>INSUFFICIENT FUNDS — TRADE SKIPPED</b>\n\n"
+            f"{symbol}\nRequired: ₹{required:,.0f} (+5% buffer)\n"
+            f"Available: ₹{available:,.0f}\n\n"
+            f"Add funds or reduce LOT_SIZE in .env"
+        )
+        return
+
+    send_telegram(f"🤖 <b>AUTO-EXECUTING MORNING ENTRY</b>\nBUY {symbol}\nQty: {LOT_SIZE} | LTP: {ltp}")
+
+    order_id = place_entry_order(symbol, LOT_SIZE)
+    if not order_id:
+        return
+
+    avg_price = get_order_avg_price(order_id)
+    if avg_price is None:
+        send_telegram(f"⚠️ Order {order_id} for {symbol} not confirmed — CHECK KITE MANUALLY")
+        return
+
+    spot_sl_pts  = price * SL_PCT
+    spot_tgt_pts = price * TARGET_PCT
+    sl_premium     = round(avg_price - spot_sl_pts  * OPTION_DELTA, 1)
+    target_premium = round(avg_price + spot_tgt_pts * OPTION_DELTA, 1)
+
+    gtt_id = place_gtt_oco(symbol, LOT_SIZE, sl_premium, target_premium, avg_price)
+
+    position = {
+        "symbol": symbol, "signal": signal, "qty": LOT_SIZE,
+        "entry_spot": price, "entry_premium": avg_price,
+        "entry_time": datetime.now(), "sl_premium": sl_premium,
+        "target_premium": target_premium, "gtt_id": gtt_id,
+        "breakeven_hit": False, "weak_checked": False, "order_id": order_id,
+        "peak_favorable": 0.0, "trail_active": False
+    }
+    save_position_state()
+
+    gtt_status = "Set ✅" if gtt_id else "FAILED ⚠️ manage manually!"
+    send_telegram(
+        f"✅ <b>MORNING POSITION OPEN</b>\n\n"
+        f"{symbol}\nEntry: {avg_price}\n"
+        f"SL: {sl_premium} ({round(spot_sl_pts,1)} pts)\n"
+        f"Target: {target_premium} ({round(spot_tgt_pts,1)} pts)\n"
+        f"Breakeven: +{round(price * BREAKEVEN_PCT, 1)} pts\n"
+        f"GTT OCO: {gtt_status}"
+    )
+
+def monitor_position(current_spot):
+    """Breakeven, trailing stop, weak exit, hard exit — matches backtest logic exactly."""
+    global position
+    if position is None: return
+
+    spot_move = (current_spot - position["entry_spot"]) if position["signal"] == "BUY" \
+                else (position["entry_spot"] - current_spot)
+    be_threshold = position["entry_spot"] * BREAKEVEN_PCT
+    position["peak_favorable"] = max(position.get("peak_favorable", 0.0), spot_move)
+
+    if not position["breakeven_hit"] and spot_move >= be_threshold:
+        if position["gtt_id"]:
+            ok = modify_gtt_sl(position["gtt_id"], position["symbol"], position["qty"],
+                               position["entry_premium"], position["target_premium"],
+                               position["entry_premium"])
+            if ok:
+                position["breakeven_hit"] = True
+                save_position_state()
+                send_telegram(f"⚖️ <b>BREAKEVEN ACTIVATED</b>\n{position['symbol']}\nSL moved to entry: {position['entry_premium']}")
+
+    trail_trigger_dist = be_threshold * TRAIL_TRIGGER_MULT
+    trail_step_dist    = be_threshold * TRAIL_STEP_MULT
+    if position["peak_favorable"] >= trail_trigger_dist and position["gtt_id"]:
+        new_sl_spot_dist = position["peak_favorable"] - trail_step_dist
+        new_sl_premium = round(position["entry_premium"] + new_sl_spot_dist * OPTION_DELTA, 1)
+        is_better = (new_sl_premium > position["sl_premium"]) if position["signal"] == "BUY" \
+                    else (new_sl_premium < position["sl_premium"])
+        if is_better:
+            est_current_premium = round(position["entry_premium"] + spot_move * OPTION_DELTA, 1)
+            ok = modify_gtt_sl(position["gtt_id"], position["symbol"], position["qty"],
+                               new_sl_premium, position["target_premium"], est_current_premium)
+            if ok:
+                position["sl_premium"] = new_sl_premium
+                position["breakeven_hit"] = True
+                position["trail_active"] = True
+                save_position_state()
+                send_telegram(f"🔒 <b>TRAILING STOP</b>\n{position['symbol']}\nSL moved to {new_sl_premium} (locking profit)")
+
+    elapsed_min = (datetime.now() - position["entry_time"]).total_seconds() / 60
+    if elapsed_min >= 15 and not position["weak_checked"]:
+        position["weak_checked"] = True
+        if spot_move < MOMENTUM_MIN:
+            send_telegram(f"⚠️ <b>WEAK MOMENTUM</b> — exiting {position['symbol']} (only {spot_move:.1f}pts after 15min)")
+            exit_position("WEAK")
+            return
+
+    if datetime.now().time() >= HARD_EXIT:
+        send_telegram(f"⏰ <b>HARD EXIT TIME (3:10 PM)</b> — closing {position['symbol']}")
+        exit_position("EOD")
+
+def exit_position(reason):
+    """Cancel GTT + market exit. Called for WEAK/EOD/MANUAL exits."""
+    global position
+    if position is None: return
+    if position["gtt_id"]:
+        cancel_gtt(position["gtt_id"])
+    order_id = place_exit_order(position["symbol"], position["qty"])
+    send_telegram(f"🔚 <b>POSITION CLOSED ({reason})</b>\n{position['symbol']}\nExit order: {order_id}")
+    position = None
+    save_position_state()
+
 # ─── SIGNAL ENGINE — CE-only ATM, 4 conditions ───
 # Backtest winner (60 days): 21 trades, 81% win rate, 2 SL, Rs6,873 net
 # Tested vs SOLID (5 cond) → 74% win, and SOLID+PE → 62% win.
@@ -534,10 +895,12 @@ def format_alert(signal, price, info, alert_num):
     sl  = round(price - sl_pts, 2)
     tgt = round(price + tgt_pts, 2)
 
+    mode_line = "🟢 AUTO-ARMED — order placed automatically" if AUTO_ARMED else "🔵 SIGNAL-ONLY — decide entry yourself"
+
     msg = f"""🌅 <b>BUY CE 📈</b>
 
 📡 <b>MORNING WINDOW</b> ({MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')} only)
-🔵 SIGNAL-ONLY — decide entry yourself
+{mode_line}
 📅 {now_str}
 💹 BUY <b>{strike}</b>
 📊 Nifty: {price:.2f}
@@ -560,25 +923,27 @@ def format_alert(signal, price, info, alert_num):
 
 # ─── MAIN ───
 def run_scanner():
-    print("="*60)
-    print("  NIFTY MORNING SCANNER — CE ONLY, SIGNAL-ONLY")
+    print("="*65)
+    print("  NIFTY MORNING SCANNER — CE ONLY + AUTO EXECUTION")
     print(f"  Window: {MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')}")
     print("  4 conditions: VWAP + Supertrend + Breakout + Clean candle")
-    print("  CE (BUY) only — backtest confirmed 81% win rate, best strategy")
-    print("  NEVER places real orders — separate from the main bot")
-    print("="*60)
+    print("  CE (BUY) only — 81% win rate (60d backtest)")
+    print("  Auto-trade: DISARMED (send /start_auto to arm)")
+    print("="*65)
 
     if not login(): return
+
+    load_position_state()  # recover any position from before a restart
 
     send_telegram(
         "🌅 <b>Morning Scanner Started</b>\n\n"
         f"Window: {MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')} only\n"
-        "🔵 SIGNAL-ONLY — separate from the main bot, never trades\n"
-        "Strategy: <b>CE (BUY) only — ATM options, 4 conditions</b>\n"
+        "Strategy: <b>CE (BUY) only — ATM, 4 conditions</b>\n"
         "  VWAP + Supertrend + Breakout + Clean candle\n\n"
-        "Backtest (60d): <b>81% win rate</b>, 2 SL only, Rs3,436/month\n"
-        "Tested SOLID(+EMA+3pt) → 74% | SOLID+PE → 62% | Original wins\n\n"
-        "Send /morning_help for commands"
+        "Backtest (60d): <b>81% win rate</b>, 2 SL only\n\n"
+        "🔴 <b>Auto-trade: DISARMED</b> — signal-only mode\n"
+        "Send /start_auto to enable real order placement\n"
+        "Send /morning_help for all commands"
     )
 
     alerts_today = 0; last_date = None; last_dir = None; window_opened_today = False
@@ -597,22 +962,36 @@ def run_scanner():
                 else:
                     send_telegram("🆘 <b>MORNING SCANNER — NEW DAY LOGIN FAILED</b>")
 
+            if now.weekday() == EXPIRY_WEEKDAY and position is None:
+                print(f"⏳ [{now.strftime('%H:%M')}] Tuesday (expiry) — no morning signals")
+                sleep_poll(300); continue
+
+            # ─── POSITION MONITORING (runs all day regardless of window) ───
+            if position is not None:
+                check_gtt_triggered()   # detect if GTT (SL/target) fired externally
+                if position is not None:
+                    df5 = fetch_data(NIFTY_TOKEN, "5minute", days=2)
+                    if df5 is not None and not df5.empty:
+                        current_price = float(df5.iloc[-1]['Close'])
+                        print(f"  [{now.strftime('%H:%M')}] Monitoring {position['symbol']} | Nifty: {current_price:.2f}")
+                        monitor_position(current_price)
+                sleep_poll(60); continue
+
+            # ─── OUTSIDE MORNING WINDOW — idle ───
             if ct < MORNING_START or ct > MORNING_END:
                 print(f"⏳ [{now.strftime('%H:%M')}] Outside morning window — idle")
                 sleep_poll(120); continue
 
-            if now.weekday() == EXPIRY_WEEKDAY:
-                print(f"⏳ [{now.strftime('%H:%M')}] Tuesday (expiry) — no morning signals")
-                sleep_poll(300); continue
-
             if not window_opened_today:
                 window_opened_today = True
+                armed_label = "🟢 AUTO-ARMED — will place real orders" if AUTO_ARMED else "🔴 Signal-only (send /start_auto to arm)"
                 send_telegram(
                     f"🌅 <b>Morning Window OPEN</b>\n\n"
                     f"⏰ {now.strftime('%H:%M')} — Scanning till {MORNING_END.strftime('%H:%M')}\n"
                     "Strategy: <b>CE (BUY) only — ATM, 4 conditions</b>\n"
                     "  VWAP + Supertrend + Breakout + Clean candle\n"
-                    "  Backtest: 81% win rate, only 2 SL in 60 days"
+                    f"Backtest: 81% win rate, 2 SL in 60 days\n\n"
+                    f"{armed_label}"
                 )
 
             if alerts_today >= MAX_ALERTS:
@@ -625,7 +1004,7 @@ def run_scanner():
 
             signal, price, info, opt_type = check_signals_relaxed(df5)
             if price:
-                print(f"  [{now.strftime('%H:%M')}] Nifty:{price:.2f} | Signal:{signal or 'None'}")
+                print(f"  [{now.strftime('%H:%M')}] Nifty:{price:.2f} | Signal:{signal or 'None'} | Auto:{'ON' if AUTO_ARMED else 'OFF'}")
 
             if signal == "SKIP":
                 print("  ⛔ Doji — skipping")
@@ -634,11 +1013,16 @@ def run_scanner():
                     print(f"  ⏭️ Duplicate {signal} — skipping")
                 else:
                     alerts_today += 1; last_dir = signal
-                    last_heartbeat = now  # reset heartbeat — real alert just sent
-                    print(f"  🌅 {signal} alert #{alerts_today}")
+                    last_heartbeat = now
+                    print(f"  🌅 {signal} alert #{alerts_today} | AUTO_ARMED={AUTO_ARMED}")
                     send_telegram(format_alert(signal, price, info, alerts_today))
 
-            # Periodic status — only inside window, non-irritating
+                    # Auto-execute if armed and no open position
+                    if AUTO_ARMED and position is None:
+                        execute_entry(signal, price)
+                    elif AUTO_ARMED and position is not None:
+                        send_telegram(f"ℹ️ Signal fired but position already open ({position['symbol']}) — skipping new entry")
+
             if price and info:
                 send_market_status(price, info, alerts_today)
 
