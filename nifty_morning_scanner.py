@@ -348,17 +348,18 @@ def process_telegram_commands():
         elif text == "/status":
             armed_state = "🟢 ARMED — placing real orders" if AUTO_ARMED else "🔴 DISARMED — signal-only"
             if position:
-                spot_move = (float(kite.quote([f"NFO:{position['symbol']}"])
-                             .get(f"NFO:{position['symbol']}", {}).get('last_price', position['entry_premium']))
-                             - position['entry_premium']) if True else 0
+                entry_time_str = position["entry_time"].strftime("%H:%M") if isinstance(position["entry_time"], datetime) else str(position["entry_time"])
                 pos_info = (
                     f"\n\n📦 <b>Open Position:</b>\n"
                     f"{position['signal']} {position['symbol']}\n"
-                    f"Qty: {position['qty']} | Entry: {position['entry_premium']}\n"
-                    f"SL: {position['sl_premium']} | Target: {position['target_premium']}\n"
+                    f"Entry time: {entry_time_str}\n"
+                    f"Entry premium: {position['entry_premium']}\n"
+                    f"SL premium: {position['sl_premium']}\n"
+                    f"Target premium: {position['target_premium']}\n"
                     f"Breakeven: {'✅ Hit' if position['breakeven_hit'] else '⏳ Not yet'}\n"
                     f"Trailing: {'🔒 Active' if position.get('trail_active') else 'Not yet'}\n"
-                    f"Peak move: +{position.get('peak_favorable', 0):.1f} pts"
+                    f"Peak spot move: +{position.get('peak_favorable', 0):.1f} pts\n\n"
+                    f"To exit now: send /square_off"
                 )
             else:
                 pos_info = "\n\nNo open position."
@@ -622,18 +623,22 @@ def cancel_gtt(gtt_id):
         return False
 
 def check_gtt_triggered():
-    """Detect if our GTT was fired externally (SL or target hit by Zerodha). Clears position."""
+    """Detect if our GTT fired (SL or target hit by Zerodha) and clear the position."""
     global position
     if position is None or not position.get("gtt_id"):
         return
     try:
         gtts = kite.get_gtts()
-        active_ids = {g['id'] for g in gtts if g['status'] in ('active', 'triggered')}
-        if position["gtt_id"] not in active_ids:
+        gtt_map = {g['id']: g for g in gtts}
+        our_gtt = gtt_map.get(position["gtt_id"])
+        if our_gtt is None:
+            return  # GTT not visible yet — don't clear (we cancel it ourselves on exit)
+        if our_gtt['status'] == 'triggered':
+            # Zerodha fired the GTT — SL or target was hit, position auto-closed
             send_telegram(
                 f"✅ <b>POSITION CLOSED (GTT triggered)</b>\n\n"
                 f"{position['symbol']}\nSL or Target hit — Zerodha closed the position.\n"
-                f"Check Kite for final P&L."
+                f"Check Kite app for final P&L."
             )
             position = None
             save_position_state()
