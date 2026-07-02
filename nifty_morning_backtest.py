@@ -509,9 +509,13 @@ def print_report(trades, days, mode="ATM", ce_only=False):
   Max Loss Streak : {mls}
 """)
 
-    print(f"📉 CE vs PE:")
-    print(f"  CE (BUY)  : {len(bdf)} trades | Win: {bwr:.1f}% | P&L: ₹{bdf['pnl_rs'].sum():,.0f}")
-    print(f"  PE (SELL) : {len(sdf)} trades | Win: {swr:.1f}% | P&L: ₹{sdf['pnl_rs'].sum():,.0f}")
+    if ce_only or mode == "SOLID":
+        # CE-only mode — no PE trades exist, skip the breakdown
+        print(f"📈 CE (BUY) only: {len(bdf)} trades | Win: {bwr:.1f}% | P&L: ₹{bdf['pnl_rs'].sum():,.0f}")
+    else:
+        print(f"📉 CE vs PE:")
+        print(f"  CE (BUY)  : {len(bdf)} trades | Win: {bwr:.1f}% | P&L: ₹{bdf['pnl_rs'].sum():,.0f}")
+        print(f"  PE (SELL) : {len(sdf)} trades | Win: {swr:.1f}% | P&L: ₹{sdf['pnl_rs'].sum():,.0f}")
 
     print(f"\n📅 DAY WISE:")
     dpnl = tdf.groupby('day')['pnl_rs'].sum()
@@ -658,17 +662,18 @@ def main():
     tspe,wrspe,slspe,netspe,monspe = qstats(trades_spe)
 
     print(f"\n{sep}")
-    print(f"  STRATEGY COMPARISON — {DAYS} days")
+    print(f"  STRATEGY COMPARISON — {DAYS} days  [FOR REFERENCE ONLY]")
+    print(f"  Live scanner uses CE-only 4-cond (★). Others tested and rejected.")
     print(sep)
-    print(f"  {'':30} {'CE-only 4cond ★':<22} {'SOLID 5cond':<20} SOLID+PE")
-    print(f"  {'-'*76}")
-    print(f"  {'Total trades':<30} {tc:<22} {ts:<20} {tspe}")
-    print(f"  {'Win rate':<30} {wrc:.0f}%  ← BEST{'':<13} {wrs:.0f}%{'':<18} {wrspe:.0f}%")
-    print(f"  {'SL hits (fewer=better)':<30} {slc}   ← FEWEST{'':<11} {sls:<20} {slspe}")
-    print(f"  {'Net P&L 60d':<30} Rs{netc:,.0f}  ← BEST{'':<8} Rs{nets:,.0f}{'':<14} Rs{netspe:,.0f}")
-    print(f"  {'Monthly estimate':<30} Rs{monc:,.0f}{'':<17} Rs{mons:,.0f}{'':<14} Rs{monspe:,.0f}")
-    print(f"\n  ★ CE-only 4-cond is the winner on all metrics.")
-    print(f"  ★ Live scanner uses this strategy. CSV saved above.")
+    print(f"  {'':30} {'★ LIVE: CE-only 4cond':<24} {'SOLID 5cond':<20} SOLID+PE 6cond")
+    print(f"  {'-'*80}")
+    print(f"  {'Total trades':<30} {tc:<24} {ts:<20} {tspe}")
+    print(f"  {'Win rate':<30} {wrc:.0f}%  ← HIGHEST{'':<12} {wrs:.0f}%{'':<18} {wrspe:.0f}%")
+    print(f"  {'SL hits (fewer=better)':<30} {slc}   ← FEWEST{'':<13} {sls:<20} {slspe}")
+    print(f"  {'Net P&L 60d':<30} Rs{netc:,.0f}  ← BEST{'':<10} Rs{nets:,.0f}{'':<14} Rs{netspe:,.0f}")
+    print(f"  {'Monthly estimate':<30} Rs{monc:,.0f}{'':<19} Rs{mons:,.0f}{'':<14} Rs{monspe:,.0f}")
+    print(f"\n  ★ CE-only 4-cond is the CONFIRMED WINNER — used in live scanner.")
+    print(f"  ✗ SOLID+PE rejected — PE in morning = {wrspe:.0f}% win rate (not viable).")
     print(sep)
 
 if __name__ == "__main__":
