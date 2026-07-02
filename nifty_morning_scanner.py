@@ -23,7 +23,7 @@ so you can judge and act on them manually.
 from kiteconnect import KiteConnect
 import pandas as pd
 import numpy as np
-import requests, time, webbrowser, os, json, sys
+import requests, time, webbrowser, os, json, sys, threading
 from datetime import datetime, timedelta, time as dtime
 from dotenv import load_dotenv
 from urllib.parse import urlparse, parse_qs
@@ -55,13 +55,16 @@ STRIKE_GAP     = 50
 
 # This is the ONLY thing that makes this scanner different in scope from the
 # main bot: a narrow morning window, and far fewer required conditions.
-MORNING_START = dtime(9, 30)
-MORNING_END   = dtime(11, 0)
-MAX_ALERTS    = 6   # relaxed filters fire more often — cap daily noise
+MORNING_START     = dtime(9, 30)
+MORNING_END       = dtime(11, 0)
+MAX_ALERTS        = 6   # relaxed filters fire more often — cap daily noise
+HEARTBEAT_MINS    = 20  # status ping every 20 min inside the window
 
-EXPIRY_WEEKDAY = 1  # Tuesday — informational warning only, not a filter here
+EXPIRY_WEEKDAY = 1  # Tuesday — no morning signals on expiry day
 
-telegram_offset = 0
+telegram_offset   = 0
+backtest_running  = False
+last_heartbeat    = None
 
 # ─── KITE ───
 kite = KiteConnect(api_key=API_KEY)
@@ -208,7 +211,106 @@ def get_telegram_updates():
         print(f"  TG poll error: {e}")
         return []
 
+def run_remote_backtest(days):
+    global backtest_running
+    try:
+        import nifty_morning_backtest as mbt
+        mbt.kite.set_access_token(kite.access_token)
+        send_telegram(f"⏳ Running {days}-day morning backtest... (20-40 seconds)")
+        df5 = mbt.fetch_data(mbt.NIFTY_TOKEN, "5minute", days=days)
+        if df5 is None or df5.empty:
+            send_telegram("❌ Morning backtest failed — could not fetch data."); return
+        trades = mbt.run_backtest(df5, days=days)
+        if not trades:
+            send_telegram(f"📊 Morning backtest ({days}d): No signals found."); return
+        tdf = pd.DataFrame(trades)
+        total = len(tdf); win_outcomes = ['TARGET','TRAIL']
+        wins  = len(tdf[tdf['outcome'].isin(win_outcomes)])
+        loss  = len(tdf[tdf['outcome']=='SL'])
+        bes   = len(tdf[tdf['outcome']=='BE'])
+        weak  = len(tdf[tdf['outcome']=='WEAK'])
+        wr    = wins/total*100; net = tdf['pnl_rs'].sum()
+        days_w = len(set(tdf['date']))
+        bdf = tdf[tdf['signal']=='BUY']; sdf = tdf[tdf['signal']=='SELL']
+        bwr = len(bdf[bdf['outcome'].isin(win_outcomes)])/len(bdf)*100 if len(bdf) else 0
+        swr = len(sdf[sdf['outcome'].isin(win_outcomes)])/len(sdf)*100 if len(sdf) else 0
+        verdict = "✅ PROFITABLE" if wr>=55 and net>0 else ("⚡ MARGINAL" if net>0 else "❌ Needs work")
+        msg = (
+            f"📊 <b>MORNING BACKTEST {days}d</b>\n\n"
+            f"Window: 09:30-11:00 | 4 conditions only\n"
+            f"Period: {tdf['date'].iloc[0]} → {tdf['date'].iloc[-1]}\n"
+            f"Days with signals: {days_w}\n\n"
+            f"<b>Total Signals: {total}</b>\n"
+            f"✅ Wins (Tgt+Trail): {wins} ({wr:.1f}%)\n"
+            f"❌ SL: {loss} | ⚖️ BE: {bes} | ⚠️ Weak: {weak}\n\n"
+            f"CE: {len(bdf)} trades, {bwr:.0f}% win\n"
+            f"PE: {len(sdf)} trades, {swr:.0f}% win\n\n"
+            f"💰 <b>Net P&L: ₹{net:,.0f}</b>\n\n{verdict}"
+        )
+        send_telegram(msg)
+        csv_path = f"morning_backtest_{days}d.csv"
+        tdf.to_csv(csv_path, index=False)
+        with open(csv_path, "rb") as f:
+            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+                data={"chat_id": CHAT_ID, "caption": f"📁 Morning backtest {days}d ({total} signals)"},
+                files={"document": f}, timeout=30)
+    except Exception as e:
+        send_telegram(f"❌ Morning backtest error: {e}")
+    finally:
+        backtest_running = False
+
+
+def run_remote_evening_backtest(days):
+    global backtest_running
+    try:
+        import nifty_evening_backtest as ebt
+        ebt.kite.set_access_token(kite.access_token)
+        send_telegram(f"⏳ Running {days}-day evening backtest... (20-40 seconds)")
+        df5  = ebt.fetch_data(ebt.NIFTY_TOKEN, "5minute",  days=days)
+        df15 = ebt.fetch_data(ebt.NIFTY_TOKEN, "15minute", days=days)
+        if df5 is None or df5.empty:
+            send_telegram("❌ Evening backtest failed — could not fetch data."); return
+        trades = ebt.run_backtest(df5, df15, days=days)
+        if not trades:
+            send_telegram(f"📊 Evening backtest ({days}d): No signals found."); return
+        tdf = pd.DataFrame(trades)
+        total = len(tdf); win_outcomes = ['TARGET', 'TRAIL']
+        wins  = len(tdf[tdf['outcome'].isin(win_outcomes)])
+        loss  = len(tdf[tdf['outcome'] == 'SL'])
+        bes   = len(tdf[tdf['outcome'] == 'BE'])
+        weak  = len(tdf[tdf['outcome'] == 'WEAK'])
+        wr    = wins / total * 100; net = tdf['pnl_rs'].sum()
+        days_w = len(set(tdf['date']))
+        sdf   = tdf[tdf['signal'] == 'SELL']
+        swr   = len(sdf[sdf['outcome'].isin(win_outcomes)]) / len(sdf) * 100 if len(sdf) else 0
+        verdict = "✅ PROFITABLE" if wr >= 55 and net > 0 else ("⚡ MARGINAL" if net > 0 else "❌ Needs work")
+        msg = (
+            f"📊 <b>EVENING BACKTEST {days}d</b> [TIGHT MODE]\n\n"
+            f"Window: 13:00-14:30 | PE/SELL only\n"
+            f"6 conditions: VWAP + ST + 15min bearish + Breakdown + Clean + RSI(35-55)\n"
+            f"Period: {tdf['date'].iloc[0]} → {tdf['date'].iloc[-1]}\n"
+            f"Days with signals: {days_w}\n\n"
+            f"<b>Total Signals: {total}</b>\n"
+            f"✅ Wins (Tgt+Trail): {wins} ({wr:.1f}%)\n"
+            f"❌ SL: {loss} | ⚖️ BE: {bes} | ⚠️ Weak: {weak}\n\n"
+            f"PE: {len(sdf)} trades, {swr:.0f}% win\n\n"
+            f"💰 <b>Net P&L: ₹{net:,.0f}</b>\n\n{verdict}"
+        )
+        send_telegram(msg)
+        csv_path = f"evening_backtest_{days}d.csv"
+        tdf.to_csv(csv_path, index=False)
+        with open(csv_path, "rb") as f:
+            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+                data={"chat_id": CHAT_ID, "caption": f"📁 Evening backtest {days}d ({total} signals)"},
+                files={"document": f}, timeout=30)
+    except Exception as e:
+        send_telegram(f"❌ Evening backtest error: {e}")
+    finally:
+        backtest_running = False
+
+
 def process_telegram_commands():
+    global backtest_running
     updates = get_telegram_updates()
     for u in updates:
         msg = u.get("message", {})
@@ -221,15 +323,39 @@ def process_telegram_commands():
                 "📊 <b>Morning Scanner Status</b>\n\n"
                 "🔵 SIGNAL-ONLY — never places real orders\n"
                 f"🌅 Active window: {MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')}\n"
-                "Only mandatory filters: VWAP + Supertrend + EMA momentum + Breakout"
+                "Only mandatory filters: VWAP + Supertrend + Breakout + Clean candle"
             )
         elif text == "/morning_help":
             send_telegram(
                 "🤖 <b>Morning Scanner Commands</b>\n\n"
                 "🔵 Relaxed-filter, signal-only — runs alongside the main bot, never trades.\n\n"
                 "/morning_status — confirm it's running\n"
+                "/backtest [days] — backtest morning signals (default 60, max 100)\n"
+                "/backtest_evening [days] — backtest evening signals (default 60, max 100)\n"
                 "/morning_help — this message"
             )
+        elif text == "/backtest" or text.startswith("/backtest "):
+            if backtest_running:
+                send_telegram("⏳ A backtest is already running — please wait.")
+            else:
+                parts = text.split(); days = 60
+                if len(parts) > 1:
+                    try: days = max(5, min(100, int(parts[1])))
+                    except ValueError:
+                        send_telegram("⚠️ Usage: /backtest 60  (5-100 days)"); continue
+                backtest_running = True
+                threading.Thread(target=run_remote_backtest, args=(days,), daemon=True).start()
+        elif text == "/backtest_evening" or text.startswith("/backtest_evening "):
+            if backtest_running:
+                send_telegram("⏳ A backtest is already running — please wait.")
+            else:
+                parts = text.split(); days = 60
+                if len(parts) > 1:
+                    try: days = max(5, min(100, int(parts[1])))
+                    except ValueError:
+                        send_telegram("⚠️ Usage: /backtest_evening 60  (5-100 days)"); continue
+                backtest_running = True
+                threading.Thread(target=run_remote_evening_backtest, args=(days,), daemon=True).start()
 
 def sleep_poll(seconds):
     elapsed = 0
@@ -241,7 +367,7 @@ def sleep_poll(seconds):
 
 # ─── DATA ───
 def fetch_data(token, interval="5minute", days=2):
-    try:
+    def _fetch():
         candles = kite.historical_data(token, datetime.now()-timedelta(days=days),
                                        datetime.now(), interval)
         if not candles: return None
@@ -250,7 +376,18 @@ def fetch_data(token, interval="5minute", days=2):
         df.set_index('date', inplace=True)
         df.index = pd.to_datetime(df.index)
         return df.dropna()
+    try:
+        return _fetch()
     except Exception as e:
+        err = str(e)
+        if "access_token" in err or "api_key" in err or "Incorrect" in err:
+            print(f"  ⚠️ Auth error — re-logging in automatically...")
+            send_telegram("⚠️ <b>Morning Scanner: session expired</b> — re-logging in automatically...")
+            if login():
+                try:
+                    return _fetch()
+                except Exception as e2:
+                    print(f"  Data error after relogin: {e2}"); return None
         print(f"  Data error: {e}"); return None
 
 # ─── INDICATORS (same as main bot) ───
@@ -304,15 +441,10 @@ def check_signals_relaxed(df5):
         return None, None, None, None
 
     df5 = df5.copy()
-    df5['EMA9']  = ema(df5['Close'], 9)
-    df5['EMA20'] = ema(df5['Close'], 20)
-    df5['VWAP']  = calculate_vwap(df5)
+    df5['VWAP']       = calculate_vwap(df5)
     df5['Supertrend'] = calculate_supertrend(df5)
-    df5['RSI']   = calculate_rsi(df5['Close'])
-    df5['Vol']   = df5['Volume']
-    df5['AvgVol'] = df5['Vol'].rolling(20).mean()
 
-    df5 = df5.dropna(subset=['EMA9','EMA20','VWAP'])
+    df5 = df5.dropna(subset=['VWAP'])
     if len(df5) < 2:
         return None, None, None, None
 
@@ -320,34 +452,69 @@ def check_signals_relaxed(df5):
     price = float(curr['Close'])
     o,h,l,c = float(curr['Open']),float(curr['High']),float(curr['Low']),float(curr['Close'])
     vwap  = float(curr['VWAP'])
-    ema9  = float(curr['EMA9']); ema20 = float(curr['EMA20'])
-    pe9   = float(prev['EMA9']); pe20  = float(prev['EMA20'])
     st    = bool(curr['Supertrend'])
     ph    = float(prev['High']); pl = float(prev['Low'])
-    rsi   = float(curr['RSI']) if not pd.isna(curr['RSI']) else None
-    vol_ratio = float(curr['Vol']/curr['AvgVol']) if curr['AvgVol'] > 0 else None
 
     is_doji, bull_clean, bear_clean = analyze_candle(o,h,l,c)
     if is_doji:
         return "SKIP", price, None, None
 
-    # ── MANDATORY ONLY: VWAP + Supertrend + EMA momentum + Breakout ──
-    ema_gap = ema9 - ema20; prev_gap = pe9 - pe20
-    cross_up   = (pe9<=pe20 and ema9>ema20) or (ema9>ema20 and ema_gap > prev_gap > 0)
-    cross_down = (pe9>=pe20 and ema9<ema20) or (ema9<ema20 and ema_gap < prev_gap < 0)
+    # 3 conditions + clean candle — no EMA, no RSI in morning window
     breakout  = price > ph
     breakdown = price < pl
 
-    buy_ok  = all([price>vwap, st==True,  cross_up,   breakout])
-    sell_ok = all([price<vwap, st==False, cross_down, breakdown])
+    buy_ok  = all([price>vwap, st==True,  breakout,  bull_clean])
+    sell_ok = all([price<vwap, st==False, breakdown, bear_clean])
 
-    info = {"rsi": rsi, "vol_ratio": vol_ratio, "bull_clean": bull_clean, "bear_clean": bear_clean}
+    info = {
+        "vwap": vwap, "st": st, "bull_clean": bull_clean, "bear_clean": bear_clean,
+        "cond_vwap_bull": price > vwap,  "cond_vwap_bear": price < vwap,
+        "cond_st_bull":   st == True,    "cond_st_bear":   st == False,
+        "cond_brk_bull":  breakout,      "cond_brk_bear":  breakdown,
+    }
 
     if buy_ok:
         return "BUY", price, info, "CE"
     elif sell_ok:
         return "SELL", price, info, "PE"
-    return None, price, None, None
+    return None, price, info, None
+
+def send_market_status(price, info, alerts_today):
+    global last_heartbeat
+    now = datetime.now()
+    if last_heartbeat is not None and (now - last_heartbeat).total_seconds() < HEARTBEAT_MINS * 60:
+        return
+    last_heartbeat = now
+
+    ck = lambda v: "✅" if v else "❌"
+    # Show both bull and bear direction to give market picture
+    if info and price:
+        vwap = info.get("vwap", 0)
+        side = "BULL" if info.get("cond_vwap_bull") else "BEAR"
+        d = 'bull' if side == 'BULL' else 'bear'
+        c_vwap = ck(info.get(f"cond_vwap_{d}"))
+        c_st   = ck(info.get(f"cond_st_{d}"))
+        c_brk  = ck(info.get(f"cond_brk_{d}"))
+        score  = sum(1 for c in [info.get(f"cond_vwap_{d}"), info.get(f"cond_st_{d}"),
+                                  info.get(f"cond_brk_{d}")] if c)
+        msg = (
+            f"🌡️ <b>Morning Window — {now.strftime('%H:%M')}</b>\n\n"
+            f"NIFTY: <b>{price:.1f}</b>   VWAP: {vwap:.1f}\n"
+            f"Lean: <b>{side}</b>\n\n"
+            f"<b>Signal conditions ({score}/3):</b>\n"
+            f"  {c_vwap} Price vs VWAP\n"
+            f"  {c_st} Supertrend direction\n"
+            f"  {c_brk} Breakout vs prev candle\n\n"
+            f"Alerts fired today: {alerts_today}/{MAX_ALERTS}\n"
+            f"<i>Signal fires when all 3 ✅ + clean candle</i>"
+        )
+    else:
+        msg = (
+            f"🌡️ <b>Morning Window — {now.strftime('%H:%M')}</b>\n"
+            f"NIFTY: {price:.1f if price else 'N/A'}  |  Alerts: {alerts_today}/{MAX_ALERTS}"
+        )
+    send_telegram(msg)
+
 
 def get_expiry_label():
     day = datetime.now().weekday()
@@ -369,16 +536,12 @@ def format_alert(signal, price, info, alert_num):
     else:
         sl = round(price + sl_pts, 2); tgt = round(price - tgt_pts, 2); be = round(price - be_pts, 2)
 
-    rsi_str = f"{info['rsi']:.1f}" if info.get('rsi') is not None else "?"
-    vol_str = f"{info['vol_ratio']:.1f}x" if info.get('vol_ratio') is not None else "?"
-    clean = info.get('bull_clean') if signal=="BUY" else info.get('bear_clean')
-
     msg = f"""🌅 <b>{signal} {side}</b>
 
-📡 <b>SPECIAL WINDOW — Relaxed Filters</b> ({MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')} only)
+📡 <b>MORNING WINDOW</b> ({MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')} only)
 🔵 SIGNAL-ONLY — decide entry yourself
 📅 {now}
-💹 BUY {strike}
+💹 {'BUY' if signal=='BUY' else 'SELL'} {strike}
 📊 Nifty: {price:.2f}
 🛑 SL: {sl} ({sl_pts:.0f} pts)
 🎯 Target: {tgt} ({tgt_pts:.0f} pts)
@@ -386,27 +549,23 @@ def format_alert(signal, price, info, alert_num):
 🔢 Alert #{alert_num}/{MAX_ALERTS}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-<b>Mandatory conditions — all 4 ✅</b>
+<b>All conditions ✅</b>
   ✅ Price vs VWAP
   ✅ Supertrend direction
-  ✅ EMA 9/20 momentum
   ✅ Breakout vs prev candle
+  ✅ Clean candle (no wick trap)
 
-<b>For reference only (not required here):</b>
-  RSI: {rsi_str} | Volume: {vol_str}x avg | Clean candle: {'Yes' if clean else 'No'}
-
-━━━━━━━━━━━━━━━━━━━━━━━━
-⚠️ This signal skipped the main bot's volume/RSI/Tier2/S&R/ORB checks —
-   it's exploratory, not the proven strategy. Judge it yourself.
 📉 {get_expiry_label()}"""
     return msg.strip()
+
+
 
 # ─── MAIN ───
 def run_scanner():
     print("="*55)
     print("  NIFTY MORNING SCANNER — RELAXED, SIGNAL-ONLY")
     print(f"  Window: {MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')}")
-    print("  Only: VWAP + Supertrend + EMA momentum + Breakout")
+    print("  Only: VWAP + Supertrend + Breakout + Clean candle")
     print("  NEVER places real orders — separate from the main bot")
     print("="*55)
 
@@ -416,11 +575,11 @@ def run_scanner():
         "🌅 <b>Morning Scanner Started</b>\n\n"
         f"Window: {MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')} only\n"
         "🔵 SIGNAL-ONLY — separate from the main bot, never trades\n"
-        "Only mandatory filters: VWAP + Supertrend + EMA momentum + Breakout\n\n"
+        "Only mandatory filters: VWAP + Supertrend + Breakout + Clean candle\n\n"
         "Send /morning_help for commands"
     )
 
-    alerts_today = 0; last_date = None; last_dir = None
+    alerts_today = 0; last_date = None; last_dir = None; window_opened_today = False
 
     while True:
         try:
@@ -429,6 +588,7 @@ def run_scanner():
 
             if last_date != cd:
                 alerts_today = 0; last_date = cd; last_dir = None
+                window_opened_today = False
                 print(f"\n📅 New day: {cd}")
                 if login():
                     print("🔐 Re-logged in for new day")
@@ -438,6 +598,19 @@ def run_scanner():
             if ct < MORNING_START or ct > MORNING_END:
                 print(f"⏳ [{now.strftime('%H:%M')}] Outside morning window — idle")
                 sleep_poll(120); continue
+
+            if now.weekday() == EXPIRY_WEEKDAY:
+                print(f"⏳ [{now.strftime('%H:%M')}] Tuesday (expiry) — no morning signals")
+                sleep_poll(300); continue
+
+            if not window_opened_today:
+                window_opened_today = True
+                send_telegram(
+                    f"🌅 <b>Morning Window OPEN</b>\n\n"
+                    f"⏰ {now.strftime('%H:%M')} — Scanning till {MORNING_END.strftime('%H:%M')}\n"
+                    "Conditions: VWAP + Supertrend + Breakout + Clean candle\n"
+                    "CE + PE signals active"
+                )
 
             if alerts_today >= MAX_ALERTS:
                 print(f"🚫 Max morning alerts reached ({MAX_ALERTS})")
@@ -458,8 +631,13 @@ def run_scanner():
                     print(f"  ⏭️ Duplicate {signal} — skipping")
                 else:
                     alerts_today += 1; last_dir = signal
+                    last_heartbeat = now  # reset heartbeat — real alert just sent
                     print(f"  🌅 {signal} alert #{alerts_today}")
                     send_telegram(format_alert(signal, price, info, alerts_today))
+
+            # Periodic status — only inside window, non-irritating
+            if price and info:
+                send_market_status(price, info, alerts_today)
 
             sleep_poll(60)
 

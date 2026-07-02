@@ -7,8 +7,8 @@ KEY="deploy/ssh-key-2026-06-30.key"
 SERVER="ubuntu@92.4.94.88"
 REMOTE_DIR="~/tradingsignalbot"
 
-echo "=== Uploading updated morning scanner ==="
-scp -i "$KEY" nifty_morning_scanner.py "$SERVER:$REMOTE_DIR/"
+echo "=== Uploading updated morning scanner + backtest ==="
+scp -i "$KEY" nifty_morning_scanner.py nifty_morning_backtest.py "$SERVER:$REMOTE_DIR/"
 
 echo "=== Restarting morning-scanner service ==="
 ssh -i "$KEY" "$SERVER" "sudo systemctl restart morning-scanner"

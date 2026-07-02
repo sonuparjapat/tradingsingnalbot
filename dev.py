@@ -18,6 +18,7 @@ SCRIPTS = {
     'sensex_bot':       'sensex_zerodha_bot.py',
     'sensex_backtest':  'sensex_zerodha_backtest.py',
     'morning_scanner':  'nifty_morning_scanner.py',
+    'morning_backtest': 'nifty_morning_backtest.py',
 }
 
 WATCH_EXTENSIONS = {'.py'}

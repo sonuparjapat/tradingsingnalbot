@@ -1,0 +1,18 @@
+[Unit]
+Description=Nifty Evening Scanner (PE/SELL only, signal-only, 13:00-14:30)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/tradingsignalbot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/tradingsignalbot/venv/bin/python3 -u /home/ubuntu/tradingsignalbot/nifty_evening_scanner.py
+Restart=always
+RestartSec=15
+StandardOutput=append:/home/ubuntu/tradingsignalbot/evening_scanner.log
+StandardError=append:/home/ubuntu/tradingsignalbot/evening_scanner_error.log
+
+[Install]
+WantedBy=multi-user.target

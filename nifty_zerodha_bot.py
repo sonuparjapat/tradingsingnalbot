@@ -2,8 +2,7 @@
 =============================================================
 NIFTY SIGNAL BOT — MATCHES BACKTEST EXACTLY
 =============================================================
-Tier 1 (ALL 5): VWAP + Supertrend + EMA cross/expanding
-                 + Volume spike + Breakout
+Tier 1 (ALL 4): VWAP + Supertrend + Volume spike + Breakout
 Tier 2: 15min trend, candle, expiry, ORB
 Target: ~17pts | SL: ~15pts | Breakeven: ~8pts
 Weak exit: if <5pts after 15min
@@ -414,7 +413,7 @@ def sleep_poll(seconds):
 
 # ─── DATA ───
 def fetch_data(token, interval="5minute", days=2):
-    try:
+    def _fetch():
         candles = kite.historical_data(token, datetime.now()-timedelta(days=days),
                                        datetime.now(), interval)
         if not candles: return None
@@ -423,7 +422,18 @@ def fetch_data(token, interval="5minute", days=2):
         df.set_index('date', inplace=True)
         df.index = pd.to_datetime(df.index)
         return df.dropna()
+    try:
+        return _fetch()
     except Exception as e:
+        err = str(e)
+        if "access_token" in err or "api_key" in err or "Incorrect" in err:
+            print(f"  ⚠️ Auth error — re-logging in automatically...")
+            send_telegram("⚠️ <b>Session expired mid-day</b> — re-logging in automatically...")
+            if login():
+                try:
+                    return _fetch()
+                except Exception as e2:
+                    print(f"  Data error after relogin: {e2}"); return None
         print(f"  Data error: {e}"); return None
 
 def find_nifty_fut_token():
@@ -826,7 +836,7 @@ def check_signals(df5, df15, fut_vol):
         e20 = float(ema(df15['Close'], 20).iloc[-1])
         trend15 = e9 > e20
 
-    df5 = df5.dropna(subset=['EMA9','EMA20','VWAP','AvgVol'])
+    df5 = df5.dropna(subset=['VWAP','AvgVol'])
     if len(df5) < 2:
         return None, None, {}, {}, None, None, None
 
@@ -834,8 +844,6 @@ def check_signals(df5, df15, fut_vol):
     price = float(curr['Close'])
     o,h,l,c = float(curr['Open']),float(curr['High']),float(curr['Low']),float(curr['Close'])
     vwap  = float(curr['VWAP'])
-    ema9  = float(curr['EMA9']); ema20 = float(curr['EMA20'])
-    pe9   = float(prev['EMA9']); pe20  = float(prev['EMA20'])
     st    = bool(curr['Supertrend'])
     vol   = float(curr['Vol']); avg_vol = float(curr['AvgVol'])
     ph    = float(prev['High']); pl = float(prev['Low'])
@@ -853,14 +861,11 @@ def check_signals(df5, df15, fut_vol):
     orb_bear = (orb_low  is not None) and (price < orb_low)
 
     vol_spike = vol > (avg_vol * day_vol_multi) if avg_vol > 0 else False
-    ema_gap = ema9 - ema20; prev_gap = pe9 - pe20
-    cross_up   = (pe9<=pe20 and ema9>ema20) or (ema9>ema20 and ema_gap > prev_gap > 0)
-    cross_down = (pe9>=pe20 and ema9<ema20) or (ema9<ema20 and ema_gap < prev_gap < 0)
-    breakout  = price > ph + day_breakout_buffer   # extra buffer on expiry day filters fake pokes
+    breakout  = price > ph + day_breakout_buffer
     breakdown = price < pl - day_breakout_buffer
 
-    buy_t1  = all([price>vwap, st==True,  cross_up,   vol_spike, breakout])
-    sell_t1 = all([price<vwap, st==False, cross_down, vol_spike, breakdown])
+    buy_t1  = all([price>vwap, st==True,  vol_spike, breakout])
+    sell_t1 = all([price<vwap, st==False, vol_spike, breakdown])
 
     if not buy_t1 and not sell_t1:
         return None, price, {}, {}, None, rsi, expiry_label
@@ -878,8 +883,7 @@ def check_signals(df5, df15, fut_vol):
             return None, price, {}, {}, None, rsi, expiry_label
         tier1 = {
             "Price > VWAP": True, "Supertrend Green": True,
-            "EMA 9/20 momentum": True, "Volume Spike": True,
-            "Breakout": True,
+            "Volume Spike": True, "Breakout": True,
         }
         tier2 = {
             f"RSI ({rsi:.1f})": True,
@@ -901,8 +905,7 @@ def check_signals(df5, df15, fut_vol):
             return None, price, {}, {}, None, rsi, expiry_label
         tier1 = {
             "Price < VWAP": True, "Supertrend Red": True,
-            "EMA 9/20 momentum": True, "Volume Spike": True,
-            "Breakdown": True,
+            "Volume Spike": True, "Breakdown": True,
         }
         tier2 = {
             f"RSI ({rsi:.1f})": True,
@@ -984,7 +987,7 @@ def run_bot():
     print("="*55)
     print("  NIFTY SIGNAL BOT — MATCHES BACKTEST")
     print("  Target ~17pts | SL ~15pts | BE ~8pts")
-    print("  Tier1: VWAP+ST+EMA+Vol+Breakout")
+    print("  Tier1: VWAP+ST+Vol+Breakout")
     print("  Tier2: 15min+Candle+Expiry+ORB")
     print("  Auto-trade: DISARMED (send /start_auto to arm)")
     print("="*55)
@@ -1002,7 +1005,7 @@ def run_bot():
 
     send_telegram(
         "🤖 <b>Nifty Signal Bot Started</b>\n\n"
-        "📊 Tier1: VWAP + Supertrend + EMA + Volume + Breakout\n"
+        "📊 Tier1: VWAP + Supertrend + Volume + Breakout\n"
         "🎯 Target: ~17pts | SL: ~15pts\n"
         "⚖️ Breakeven at ~8pts\n"
         "⏰ 9:30 AM — 2:00 PM\n\n"

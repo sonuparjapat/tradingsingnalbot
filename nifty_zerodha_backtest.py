@@ -391,7 +391,7 @@ def run_backtest(df5, df15, fut_vol):
     else:
         df5['Trend15']=None
 
-    df5=df5.dropna(subset=['EMA9','EMA20','VWAP','RSI','AvgVol','ATR14'])
+    df5=df5.dropna(subset=['VWAP','RSI','AvgVol','ATR14'])
     days=len(set(df5.index.date))
     print(f"  Candles: {len(df5)} | Days: {days}\n")
 
@@ -420,8 +420,6 @@ def run_backtest(df5, df15, fut_vol):
         price=float(row['Close'])
         o,h,l,c=float(row['Open']),float(row['High']),float(row['Low']),float(row['Close'])
         vwap=float(row['VWAP'])
-        ema9=float(row['EMA9']); ema20=float(row['EMA20'])
-        pe9=float(prev['EMA9']); pe20=float(prev['EMA20'])
         st=bool(row['Supertrend'])
         vol=float(row['Vol']); avg_vol=float(row['AvgVol'])
         ph=float(prev['High']); pl=float(prev['Low'])
@@ -438,9 +436,6 @@ def run_backtest(df5, df15, fut_vol):
         orb_bear=(orb_low  is not None) and (price<orb_low)
 
         vol_spike = vol>(avg_vol*day_vol_multi) if avg_vol>0 else False
-        ema_gap = ema9 - ema20; prev_gap = pe9 - pe20
-        cross_up   = (pe9<=pe20 and ema9>ema20) or (ema9>ema20 and ema_gap > prev_gap > 0)
-        cross_down = (pe9>=pe20 and ema9<ema20) or (ema9<ema20 and ema_gap < prev_gap < 0)
         if USE_BREAKOUT_CONFIRM:
             # Breakout level = high/low TWO candles back; require both the
             # breakout candle (prev) and this candle to hold beyond it.
@@ -452,8 +447,8 @@ def run_backtest(df5, df15, fut_vol):
             breakout  = price > ph + day_breakout_buffer   # extra buffer on expiry day filters fake pokes
             breakdown = price < pl - day_breakout_buffer
 
-        buy_t1  = all([price>vwap, st==True,  cross_up,   vol_spike, breakout])
-        sell_t1 = all([price<vwap, st==False, cross_down, vol_spike, breakdown])
+        buy_t1  = all([price>vwap, st==True,  vol_spike, breakout])
+        sell_t1 = all([price<vwap, st==False, vol_spike, breakdown])
 
         if not buy_t1 and not sell_t1: continue
         if is_doji: continue
@@ -576,7 +571,6 @@ def run_backtest(df5, df15, fut_vol):
             "pnl_pct":round(pnl_pct*100,2),
             "premium_pts":round(premium_pts,1),"pnl_rs":pnl_rs,
             "rsi":round(rsi,1),
-            "ema9":round(ema9,1),"ema20":round(ema20,1),
             "vwap":round(vwap,1),"supertrend":"Green" if st else "Red",
             "vol_ratio":round(vol/avg_vol,1) if avg_vol>0 else 0,
             "day":ts.strftime("%A")
@@ -629,7 +623,7 @@ def print_report(trades):
     sep="="*65
     print(f"\n{sep}")
     print(f"  NIFTY BACKTEST — Target ~{round(tdf['tgt_pts'].mean())}pts | SL ~{round(tdf['sl_pts'].mean())}pts")
-    print(f"  + Breakeven trailing | Trailing stop | EMA expanding gap")
+    print(f"  + Breakeven trailing | Trailing stop")
     print(f"  Risk mode: {'ATR-DYNAMIC (experimental)' if USE_ATR_DYNAMIC else 'FIXED % (proven baseline)'}")
     print(f"  P&L mode: Estimated option premium (delta+theta model), LOT_SIZE={LOT_SIZE}")
     print(f"  Breakout mode: {'2-CANDLE CONFIRM (experimental)' if USE_BREAKOUT_CONFIRM else '1-CANDLE (proven baseline)'}")
