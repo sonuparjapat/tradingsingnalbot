@@ -4,7 +4,9 @@ NIFTY MORNING SCANNER — CE-only ATM, with AUTO EXECUTION
 =============================================================
 Scans the 9:30-11:00 AM window for high-quality CE (BUY) signals.
 Strategy: VWAP + Supertrend + Breakout + Bull clean candle (4 conditions).
-Backtest (60d): 81% win rate, 2 SL only — best morning strategy tested.
+SL: prev candle low - 5pt (dynamic candle structure).
+Target: 25pt fixed on spot price.
+Backtest (60d): 90.5% win rate, 0 SL — confirmed best morning strategy.
 
 SIGNAL-ONLY by default — starts disarmed. Send /start_auto on Telegram
 to arm real order execution. Send /stop_auto to disarm. One position at a time.
@@ -41,10 +43,12 @@ KITE_TOTP_SECRET = os.getenv("KITE_TOTP_SECRET")
 
 # ─── CONFIG ───
 NIFTY_TOKEN = 256265
-SL_PCT         = 0.00063   # same levels as main bot, shown for reference only
-TARGET_PCT     = 0.00071
-BREAKEVEN_PCT  = 0.00034
+BREAKEVEN_PCT  = 0.00034   # breakeven activation threshold (fixed %)
 STRIKE_GAP     = 50
+
+# Candle-structure SL + fixed target (backtest winner: 90.5% win, 0 SL in 60d)
+CANDLE_SL_BUFFER = 5    # spot pts below prev candle low
+TARGET_PTS       = 25   # fixed spot pts target
 
 # This is the ONLY thing that makes this scanner different in scope from the
 # main bot: a narrow morning window, and far fewer required conditions.
@@ -198,11 +202,15 @@ def login():
 def send_telegram(msg):
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print(f"\n{'='*50}\n[TG]\n{msg}\n{'='*50}"); return
-    try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id":CHAT_ID,"text":msg,"parse_mode":"HTML"}, timeout=10)
-    except Exception as e:
-        print(f"TG error: {e}")
+    for attempt in range(3):
+        try:
+            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id":CHAT_ID,"text":msg,"parse_mode":"HTML"}, timeout=10)
+            return
+        except Exception as e:
+            print(f"TG error (attempt {attempt+1}/3): {e}")
+            if attempt < 2:
+                time.sleep(3)
 
 def get_telegram_updates():
     global telegram_offset
@@ -228,7 +236,8 @@ def run_remote_backtest(days):
         df5 = mbt.fetch_data(mbt.NIFTY_TOKEN, "5minute", days=days)
         if df5 is None or df5.empty:
             send_telegram("❌ Morning backtest failed — could not fetch data."); return
-        trades = mbt.run_backtest(df5, days=days, mode="ATM", ce_only=True)
+        trades = mbt.run_backtest(df5, days=days, mode="ATM", ce_only=True,
+                                       candle_sl=True, target_pts=25)
         if not trades:
             send_telegram(f"📊 Morning backtest ({days}d): No signals found."); return
         tdf = pd.DataFrame(trades)
@@ -368,7 +377,7 @@ def process_telegram_commands():
                 f"Auto-trade: {armed_state}\n"
                 f"Window: {MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')}\n"
                 f"Strategy: CE (BUY) only | 4 conditions | ATM\n"
-                f"Backtest: 81% win rate, 2 SL/60d{pos_info}"
+                f"Backtest: 90.5% win rate, 0 SL/60d{pos_info}"
             )
         elif text == "/square_off":
             if position:
@@ -385,13 +394,13 @@ def process_telegram_commands():
                 f"🌅 Window: {MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')}\n"
                 "Strategy: <b>CE (BUY) only — ATM, 4 conditions</b>\n"
                 "  VWAP + Supertrend + Breakout + Clean candle\n\n"
-                "Backtest (60d): 81% win rate, 2 SL\n"
+                "Backtest (60d): 90.5% win rate, 0 SL\n"
                 "Send /start_auto to arm | /stop_auto to disarm"
             )
         elif text == "/morning_help":
             send_telegram(
                 "🤖 <b>Morning Scanner Commands</b>\n\n"
-                "CE-only ATM strategy | 4 conditions | 81% win rate (60d backtest)\n\n"
+                "CE-only ATM strategy | 4 conditions | 90.5% win rate (60d backtest)\n\n"
                 "/start_auto — arm real order execution\n"
                 "/stop_auto — disarm (no new entries)\n"
                 "/status — show armed state + open position\n"
@@ -681,7 +690,7 @@ def load_position_state():
         print(f"⚠️ Could not load position state: {e}")
         send_telegram(f"⚠️ <b>Found a saved morning position but couldn't load it!</b>\n{e}\n\nCheck Kite manually.")
 
-def execute_entry(signal, price):
+def execute_entry(signal, price, prev_low):
     """Place a real BUY CE order. Called only when AUTO_ARMED and position is None."""
     global position
     symbol = find_option_symbol(price, signal)
@@ -717,10 +726,11 @@ def execute_entry(signal, price):
         send_telegram(f"⚠️ Order {order_id} for {symbol} not confirmed — CHECK KITE MANUALLY")
         return
 
-    spot_sl_pts  = price * SL_PCT
-    spot_tgt_pts = price * TARGET_PCT
-    sl_premium     = round(avg_price - spot_sl_pts  * OPTION_DELTA, 1)
-    target_premium = round(avg_price + spot_tgt_pts * OPTION_DELTA, 1)
+    # Candle-structure SL: few pts below previous candle low (dynamic)
+    sl_spot       = prev_low - CANDLE_SL_BUFFER
+    sl_spot_dist  = price - sl_spot          # spot pts at risk
+    sl_premium     = round(avg_price - sl_spot_dist * OPTION_DELTA, 1)
+    target_premium = round(avg_price + TARGET_PTS    * OPTION_DELTA, 1)
 
     gtt_id = place_gtt_oco(symbol, LOT_SIZE, sl_premium, target_premium, avg_price)
 
@@ -737,9 +747,9 @@ def execute_entry(signal, price):
     gtt_status = "Set ✅" if gtt_id else "FAILED ⚠️ manage manually!"
     send_telegram(
         f"✅ <b>MORNING POSITION OPEN</b>\n\n"
-        f"{symbol}\nEntry: {avg_price}\n"
-        f"SL: {sl_premium} ({round(spot_sl_pts,1)} pts)\n"
-        f"Target: {target_premium} ({round(spot_tgt_pts,1)} pts)\n"
+        f"{symbol}\nEntry premium: {avg_price}\n"
+        f"SL: {sl_premium} (prev low {prev_low:.1f} - {CANDLE_SL_BUFFER}pt = {sl_spot:.1f}, ~{sl_spot_dist:.1f}pt risk)\n"
+        f"Target: {target_premium} (+{TARGET_PTS}pt spot = +{TARGET_PTS*OPTION_DELTA:.1f}pt premium)\n"
         f"Breakeven: +{round(price * BREAKEVEN_PCT, 1)} pts\n"
         f"GTT OCO: {gtt_status}"
     )
@@ -806,10 +816,9 @@ def exit_position(reason):
     save_position_state()
 
 # ─── SIGNAL ENGINE — CE-only ATM, 4 conditions ───
-# Backtest winner (60 days): 21 trades, 81% win rate, 2 SL, Rs6,873 net
-# Tested vs SOLID (5 cond) → 74% win, and SOLID+PE → 62% win.
-# Conclusion: original 4-condition CE-only is the best morning strategy.
-# PE in morning = 47% win rate even with 15-min filter → not viable.
+# Backtest winner (60 days): 21 trades, 90.5% win rate, 0 SL, Rs9,639 net
+# SL: prev candle low - 5pt (dynamic). Target: 25pt fixed.
+# PE in morning = 41% win rate → CE-only confirmed as best.
 def check_signals_relaxed(df5):
     if len(df5) < 30:
         return None, None, None, None
@@ -828,20 +837,22 @@ def check_signals_relaxed(df5):
     vwap  = float(curr['VWAP'])
     st    = bool(curr['Supertrend'])
     ph    = float(prev['High'])
+    pl    = float(prev['Low'])
 
     is_doji, bull_clean, _ = analyze_candle(o,h,l,c)
     if is_doji:
         return "SKIP", price, None, None
 
     # 4 conditions — VWAP + Supertrend + Breakout + Bull clean candle
-    cond_vwap = price > vwap
-    cond_st   = st == True
-    cond_brk  = price > ph
+    cond_vwap  = price > vwap
+    cond_st    = st == True
+    cond_brk   = price > ph
     cond_clean = bull_clean
     buy_ok = all([cond_vwap, cond_st, cond_brk, cond_clean])
 
     info = {
         "vwap": vwap, "st": st,
+        "prev_low": pl,
         "cond_vwap_bull": cond_vwap,
         "cond_st_bull":   cond_st,
         "cond_brk_bull":  cond_brk,
@@ -892,13 +903,13 @@ def get_expiry_label():
     return names.get(day, "Weekend")
 
 def format_alert(signal, price, info, alert_num):
-    now_str = datetime.now().strftime("%d %b %Y %I:%M %p")
-    strike = get_strike(price, signal)
-    sl_pts  = round(price * SL_PCT, 1)
-    tgt_pts = round(price * TARGET_PCT, 1)
-    be_pts  = round(price * BREAKEVEN_PCT, 1)
-    sl  = round(price - sl_pts, 2)
-    tgt = round(price + tgt_pts, 2)
+    now_str  = datetime.now().strftime("%d %b %Y %I:%M %p")
+    strike   = get_strike(price, signal)
+    prev_low = info.get("prev_low", price * 0.998) if info else price * 0.998
+    sl_level = round(prev_low - CANDLE_SL_BUFFER, 2)
+    sl_pts   = round(price - sl_level, 1)
+    tgt      = round(price + TARGET_PTS, 2)
+    be_pts   = round(price * BREAKEVEN_PCT, 1)
 
     mode_line = "🟢 AUTO-ARMED — order placed automatically" if AUTO_ARMED else "🔵 SIGNAL-ONLY — decide entry yourself"
 
@@ -909,8 +920,8 @@ def format_alert(signal, price, info, alert_num):
 📅 {now_str}
 💹 BUY <b>{strike}</b>
 📊 Nifty: {price:.2f}
-🛑 SL: {sl} ({sl_pts:.0f} pts)
-🎯 Target: {tgt} ({tgt_pts:.0f} pts)
+🛑 SL: {sl_level} (prev low {prev_low:.1f} - {CANDLE_SL_BUFFER}pt = {sl_pts:.0f}pt risk)
+🎯 Target: {tgt} (+{TARGET_PTS}pt)
 ⚖️ Breakeven: move SL to entry at +{be_pts:.0f} pts
 🔢 Alert #{alert_num}/{MAX_ALERTS}
 
@@ -932,7 +943,8 @@ def run_scanner():
     print("  NIFTY MORNING SCANNER — CE ONLY + AUTO EXECUTION")
     print(f"  Window: {MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')}")
     print("  4 conditions: VWAP + Supertrend + Breakout + Clean candle")
-    print("  CE (BUY) only — 81% win rate (60d backtest)")
+    print(f"  SL: prev candle low - {CANDLE_SL_BUFFER}pt (dynamic) | Target: {TARGET_PTS}pt fixed")
+    print("  CE (BUY) only — 90.5% win rate, 0 SL (60d backtest)")
     print("  Auto-trade: DISARMED (send /start_auto to arm)")
     print("="*65)
 
@@ -944,8 +956,9 @@ def run_scanner():
         "🌅 <b>Morning Scanner Started</b>\n\n"
         f"Window: {MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')} only\n"
         "Strategy: <b>CE (BUY) only — ATM, 4 conditions</b>\n"
-        "  VWAP + Supertrend + Breakout + Clean candle\n\n"
-        "Backtest (60d): <b>81% win rate</b>, 2 SL only\n\n"
+        "  VWAP + Supertrend + Breakout + Clean candle\n"
+        f"  SL: prev candle low - {CANDLE_SL_BUFFER}pt | Target: {TARGET_PTS}pt\n\n"
+        "Backtest (60d): <b>90.5% win rate, 0 SL</b> in 60d\n\n"
         "🔴 <b>Auto-trade: DISARMED</b> — signal-only mode\n"
         "Send /start_auto to enable real order placement\n"
         "Send /morning_help for all commands"
@@ -995,7 +1008,8 @@ def run_scanner():
                     f"⏰ {now.strftime('%H:%M')} — Scanning till {MORNING_END.strftime('%H:%M')}\n"
                     "Strategy: <b>CE (BUY) only — ATM, 4 conditions</b>\n"
                     "  VWAP + Supertrend + Breakout + Clean candle\n"
-                    f"Backtest: 81% win rate, 2 SL in 60 days\n\n"
+                    f"  SL: prev low - {CANDLE_SL_BUFFER}pt | Target: {TARGET_PTS}pt\n"
+                    f"Backtest: <b>90.5% win rate, 0 SL</b> in 60 days\n\n"
                     f"{armed_label}"
                 )
 
@@ -1024,7 +1038,8 @@ def run_scanner():
 
                     # Auto-execute if armed and no open position
                     if AUTO_ARMED and position is None:
-                        execute_entry(signal, price)
+                        prev_low = info.get("prev_low", price * 0.998) if info else price * 0.998
+                        execute_entry(signal, price, prev_low)
                     elif AUTO_ARMED and position is not None:
                         send_telegram(f"ℹ️ Signal fired but position already open ({position['symbol']}) — skipping new entry")
 

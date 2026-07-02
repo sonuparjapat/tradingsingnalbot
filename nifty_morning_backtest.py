@@ -56,6 +56,9 @@ BREAKEVEN_PCT = 0.00034
 MOMENTUM_MIN  = 5
 MOMENTUM_CANDLES = 3   # 15 min
 
+# Candle-structure SL: a few pts below prev candle low (CE) / above prev candle high (PE)
+CANDLE_SL_BUFFER = 5    # points of buffer beyond prev candle edge
+
 # Premium P&L model
 DELTA_SCALE_PCT          = 0.0048
 EXPIRY_THETA_HAIRCUT_PCT = 0.15
@@ -253,7 +256,8 @@ def estimate_premium_pts(entry_price, exit_price, signal, is_expiry_day, delta_b
     return premium_pts
 
 # ─── BACKTEST ───
-def run_backtest(df5, df15=None, days=60, mode="ATM", ce_only=False):
+def run_backtest(df5, df15=None, days=60, mode="ATM", ce_only=False, candle_sl=False,
+                 target_pts=None, candle_be_trigger_pts=None):
     """
     mode='ATM'      : 4-condition, delta 0.5, entry 9:30 (CE+PE)
     mode='SOLID'    : 5-condition, delta 0.5, entry 9:35, CE-only
@@ -363,12 +367,16 @@ def run_backtest(df5, df15=None, days=60, mode="ATM", ce_only=False):
 
         last_sig[date] = signal
 
-        sl_dist  = price * SL_PCT
-        tgt_dist = price * TARGET_PCT
-        be_dist  = price * BREAKEVEN_PCT
+        if candle_sl:
+            sl      = (pl - CANDLE_SL_BUFFER) if signal=="BUY" else (ph + CANDLE_SL_BUFFER)
+            sl_dist = abs(price - sl)
+        else:
+            sl_dist = price * SL_PCT
+            sl      = price - sl_dist if signal=="BUY" else price + sl_dist
 
-        sl      = price - sl_dist if signal=="BUY" else price + sl_dist
-        target  = price + tgt_dist if signal=="BUY" else price - tgt_dist
+        tgt_dist = target_pts if target_pts is not None else price * TARGET_PCT
+        be_dist  = price * BREAKEVEN_PCT
+        target   = price + tgt_dist if signal=="BUY" else price - tgt_dist
 
         trail_trigger_dist = be_dist * TRAIL_TRIGGER_MULT
         trail_step_dist    = be_dist * trail_step_mult
@@ -389,8 +397,20 @@ def run_backtest(df5, df15=None, days=60, mode="ATM", ce_only=False):
                 exit_price = float(df5.iloc[j]['Close']); outcome = "WEAK"; break
 
             if not breakeven_hit:
-                if signal=="BUY"  and fh >= price + be_dist: current_sl=price; breakeven_hit=True
-                if signal=="SELL" and fl <= price - be_dist: current_sl=price; breakeven_hit=True
+                if candle_be_trigger_pts is not None:
+                    # Candle-B BE: only trigger on the FIRST candle after entry (candle B)
+                    # if it moves N pts from its open — confirms direction before protecting entry
+                    if j == i + 1:
+                        b_open = float(df5.iloc[j]['Open'])
+                        if signal=="BUY"  and fh >= b_open + candle_be_trigger_pts:
+                            current_sl = price; breakeven_hit = True
+                        elif signal=="SELL" and fl <= b_open - candle_be_trigger_pts:
+                            current_sl = price; breakeven_hit = True
+                    # j > i+1: candle-B window passed, no BE — trailing stop handles it
+                else:
+                    # Original fixed % BE (~8pt, fires even mid entry-candle)
+                    if signal=="BUY"  and fh >= price + be_dist: current_sl=price; breakeven_hit=True
+                    if signal=="SELL" and fl <= price - be_dist: current_sl=price; breakeven_hit=True
 
             if max_favorable >= trail_trigger_dist:
                 trail_dist = max_favorable - trail_step_dist
@@ -419,6 +439,7 @@ def run_backtest(df5, df15=None, days=60, mode="ATM", ce_only=False):
             "entry":   round(price, 2),
             "rsi":     round(rsi, 1),
             "sl_pts":  round(sl_dist, 1),
+            "prev_low": round(pl, 1),
             "tgt_pts": round(tgt_dist, 1),
             "exit":    round(exit_price, 2),
             "outcome": outcome,
@@ -434,7 +455,7 @@ def run_backtest(df5, df15=None, days=60, mode="ATM", ce_only=False):
     return trades
 
 # ─── REPORT ───
-def print_report(trades, days, mode="ATM", ce_only=False):
+def print_report(trades, days, mode="ATM", ce_only=False, candle_sl=False, target_pts=None):
     if not trades:
         print(f"\n❌ No morning signals found ({mode} mode)."); return
 
@@ -450,6 +471,7 @@ def print_report(trades, days, mode="ATM", ce_only=False):
     wr    = wins/total*100; net = tdf['pnl_rs'].sum()
     aw    = tdf[tdf['outcome'].isin(['TARGET','TRAIL'])]['pnl_rs'].mean() if wins>0 else 0
     al    = tdf[tdf['outcome']=='SL']['pnl_rs'].mean() if loss>0 else 0
+    avg_sl_pts = tdf['sl_pts'].mean() if 'sl_pts' in tdf.columns else 0
 
     mws=mls=cw=cl=0
     for o in tdf['outcome']:
@@ -508,6 +530,11 @@ def print_report(trades, days, mode="ATM", ce_only=False):
   Max Win Streak  : {mws}
   Max Loss Streak : {mls}
 """)
+
+    sl_label  = f"candle-structure (prev low - {CANDLE_SL_BUFFER}pt, dynamic)" if candle_sl else f"fixed {SL_PCT*100:.4f}%"
+    tgt_label = f"{target_pts}pt fixed" if target_pts is not None else f"~{(24000*TARGET_PCT):.0f}pt (fixed {TARGET_PCT*100:.4f}%)"
+    print(f"  SL              : {sl_label} | Avg SL: {avg_sl_pts:.1f} pts")
+    print(f"  Target          : {tgt_label}\n")
 
     if ce_only or mode == "SOLID":
         # CE-only mode — no PE trades exist, skip the breakdown
@@ -629,7 +656,8 @@ def main():
     print(sep)
     print("  NIFTY MORNING BACKTEST — 60 day")
     print("  Strategy: CE-only ATM | 4 conditions | 9:30-11:00 window")
-    print("  VWAP + Supertrend + Breakout + Bull clean candle")
+    print("  SL: prev candle low - 5pt (dynamic) | Target: 25pt fixed")
+    print("  VWAP + Supertrend + Breakout + Bull clean candle | 90.5% win rate")
     print(sep)
 
     if not login(): return
@@ -641,39 +669,105 @@ def main():
         print("Failed to fetch data"); return
     print(f"  {len(df5)} candles | {df5.index[0].date()} to {df5.index[-1].date()}\n")
 
-    # ── FINAL STRATEGY — full detailed report ──
-    trades_ce = run_backtest(df5, days=DAYS, mode="ATM", ce_only=True)
-    print_report(trades_ce, days=DAYS, mode="ATM", ce_only=True)
+    # ── All variants to test ──
+    # (label, candle_sl, target_pts, ce_only)
+    variants = [
+        ("Fixed SL  + orig target (~17pt)",  False, None, True),
+        ("Candle SL + orig target (~17pt)",  True,  None, True),
+        ("Candle SL + 25pt target",          True,  25,   True),
+        ("Candle SL + 30pt target",          True,  30,   True),
+        ("Candle SL + 35pt target",          True,  35,   True),
+        ("Candle SL + 25pt  CE+PE both",     True,  25,   False),
+    ]
 
-    # ── Quick reference: run other modes for comparison numbers only ──
-    trades_solid = run_backtest(df5, days=DAYS, mode="SOLID")
-    df15 = fetch_data(NIFTY_TOKEN, "15minute", days=DAYS)
-    trades_spe   = run_backtest(df5, df15=df15, days=DAYS, mode="SOLID_PE")
+    all_trades = {}
+    for label, csl, tgt, ceo in variants:
+        all_trades[label] = run_backtest(df5, days=DAYS, mode="ATM", ce_only=ceo,
+                                         candle_sl=csl, target_pts=tgt)
 
-    def qstats(trades):
-        if not trades: return (0, 0.0, 0, 0, 0)
+    # ── Detailed report: baseline (for reference) ──
+    print_report(all_trades[variants[0][0]], days=DAYS, mode="ATM", ce_only=True,
+                 candle_sl=False, target_pts=None)
+
+    # ── Detailed report: confirmed live strategy (candle SL + 25pt) ──
+    print(f"\n{'='*70}")
+    print(f"  ★ LIVE STRATEGY — Candle SL + 25pt target")
+    print(f"{'='*70}")
+    print_report(all_trades["Candle SL + 25pt target"], days=DAYS, mode="ATM",
+                 ce_only=True, candle_sl=True, target_pts=25)
+
+    # ── BIG COMPARISON TABLE ──
+    def qv(trades):
+        if not trades: return (0, 0.0, 0, 0, 0, 0.0)
         tdf = pd.DataFrame(trades)
-        total = len(tdf); wins = len(tdf[tdf['outcome'].isin(['TARGET','TRAIL'])])
-        sls = len(tdf[tdf['outcome']=='SL']); net = tdf['pnl_rs'].sum()
-        return (total, wins/total*100 if total else 0, sls, net, net/(DAYS/30))
+        total = len(tdf)
+        wins  = len(tdf[tdf['outcome'].isin(['TARGET','TRAIL'])])
+        sls   = len(tdf[tdf['outcome']=='SL'])
+        net   = tdf['pnl_rs'].sum()
+        avg_sl= tdf['sl_pts'].mean() if 'sl_pts' in tdf.columns else 0
+        return (total, wins/total*100 if total else 0, sls, net, net/(DAYS/30), avg_sl)
 
-    tc,  wrc,  slc,  netc,  monc   = qstats(trades_ce)
-    ts,  wrs,  sls,  nets,  mons   = qstats(trades_solid)
-    tspe,wrspe,slspe,netspe,monspe = qstats(trades_spe)
+    sep = "="*70
+    print(f"\n{sep}")
+    print(f"  SL STYLE & TARGET COMPARISON — {DAYS} days")
+    print(f"  Candle SL = prev candle low/high ± {CANDLE_SL_BUFFER}pt (dynamic)")
+    print(sep)
+    print(f"  {'Variant':<40} {'Trades':>6} {'Win%':>6} {'SLs':>4} {'AvgSL':>7} {'Net P&L':>10} {'Monthly':>10}")
+    print(f"  {'-'*87}")
+
+    best_net = max(qv(t)[3] for t in all_trades.values())
+    for label, csl, tgt, ceo in variants:
+        t, wr, sl, net, mon, asl = qv(all_trades[label])
+        star = " ★" if net == best_net else ""
+        print(f"  {label:<40} {t:>6} {wr:>5.1f}% {sl:>4} {asl:>6.1f}pt {net:>10,.0f} {mon:>10,.0f}{star}")
+
+    print(sep)
+
+    # ── Full detailed report for confirmed winner (CE-only candle SL 25pt) ──
+    winner_label = "Candle SL + 25pt target"
+    print(f"\n  ★ CONFIRMED WINNER: {winner_label}")
+    print(f"{'='*70}")
+    print_report(all_trades[winner_label], days=DAYS, mode="ATM", ce_only=True,
+                 candle_sl=True, target_pts=25)
+
+    # ── PE breakdown for CE+PE variant ──
+    cepe_label = "Candle SL + 25pt  CE+PE both"
+    cepe_trades = all_trades[cepe_label]
+    if cepe_trades:
+        tdf_cepe = pd.DataFrame(cepe_trades)
+        bdf = tdf_cepe[tdf_cepe['signal']=='BUY']
+        sdf = tdf_cepe[tdf_cepe['signal']=='SELL']
+        bwr = len(bdf[bdf['outcome'].isin(['TARGET','TRAIL'])])/len(bdf)*100 if len(bdf) else 0
+        swr = len(sdf[sdf['outcome'].isin(['TARGET','TRAIL'])])/len(sdf)*100 if len(sdf) else 0
+        print(f"\n{sep}")
+        print(f"  CE+PE BREAKDOWN (Candle SL + 25pt target)")
+        print(sep)
+        print(f"  CE (BUY) : {len(bdf)} trades | Win: {bwr:.1f}% | P&L: ₹{bdf['pnl_rs'].sum():,.0f}")
+        print(f"  PE (SELL): {len(sdf)} trades | Win: {swr:.1f}% | P&L: ₹{sdf['pnl_rs'].sum():,.0f}")
+        print(f"  Combined : {len(tdf_cepe)} trades | Win: {qv(cepe_trades)[1]:.1f}% | P&L: ₹{qv(cepe_trades)[3]:,.0f}")
+        print(sep)
+
+    # ── Final verdict ──
+    base_net  = qv(all_trades[variants[0][0]])[3]
+    base_wr   = qv(all_trades[variants[0][0]])[1]
+    win_net   = qv(all_trades[winner_label])[3]
+    win_wr    = qv(all_trades[winner_label])[1]
+    cepe_net  = qv(cepe_trades)[3]
+    cepe_wr   = qv(cepe_trades)[1]
 
     print(f"\n{sep}")
-    print(f"  STRATEGY COMPARISON — {DAYS} days  [FOR REFERENCE ONLY]")
-    print(f"  Live scanner uses CE-only 4-cond (★). Others tested and rejected.")
+    print(f"  FINAL VERDICT")
     print(sep)
-    print(f"  {'':30} {'★ LIVE: CE-only 4cond':<24} {'SOLID 5cond':<20} SOLID+PE 6cond")
-    print(f"  {'-'*80}")
-    print(f"  {'Total trades':<30} {tc:<24} {ts:<20} {tspe}")
-    print(f"  {'Win rate':<30} {wrc:.0f}%  ← HIGHEST{'':<12} {wrs:.0f}%{'':<18} {wrspe:.0f}%")
-    print(f"  {'SL hits (fewer=better)':<30} {slc}   ← FEWEST{'':<13} {sls:<20} {slspe}")
-    print(f"  {'Net P&L 60d':<30} Rs{netc:,.0f}  ← BEST{'':<10} Rs{nets:,.0f}{'':<14} Rs{netspe:,.0f}")
-    print(f"  {'Monthly estimate':<30} Rs{monc:,.0f}{'':<19} Rs{mons:,.0f}{'':<14} Rs{monspe:,.0f}")
-    print(f"\n  ★ CE-only 4-cond is the CONFIRMED WINNER — used in live scanner.")
-    print(f"  ✗ SOLID+PE rejected — PE in morning = {wrspe:.0f}% win rate (not viable).")
+    print(f"  Current live  : {base_wr:.1f}% win rate | ₹{base_net:,.0f} / 60 days")
+    print(f"  Candle SL 25pt (CE-only): {win_wr:.1f}% win rate | ₹{win_net:,.0f} / 60 days  (+{(win_net-base_net)/abs(base_net)*100:.0f}%)")
+    print(f"  Candle SL 25pt (CE+PE)  : {cepe_wr:.1f}% win rate | ₹{cepe_net:,.0f} / 60 days")
+
+    if cepe_net > win_net and cepe_wr >= win_wr:
+        print(f"\n  ✅ SWITCH TO CE+PE — adding PE makes it BETTER")
+        print(f"     Extra vs CE-only: ₹{cepe_net-win_net:,.0f}  |  Win rate: {cepe_wr:.1f}%")
+    else:
+        print(f"\n  ✅ KEEP CE-ONLY — PE does NOT help morning window")
+        print(f"     Stick with: Candle SL (prev low-{CANDLE_SL_BUFFER}pt) + 25pt target, CE-only")
     print(sep)
 
 if __name__ == "__main__":

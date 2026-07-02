@@ -97,6 +97,10 @@ BUFFER_ATR_MULT   = 0.10
 # Same model as NIFTY — see nifty_zerodha_backtest.py for full rationale.
 USE_BREAKOUT_CONFIRM = False
 
+# ── MORNING WINDOW — candle-structure SL (same concept as NIFTY morning) ──
+# SENSEX ~80k vs NIFTY ~24k (~3.3x), so buffer scales proportionally
+CANDLE_SL_BUFFER = 15   # spot pts below prev candle low (CE) / above high (PE)
+
 # ─────────────────────────────────────────
 #   LOGIN (identical to NIFTY bot/backtest — same Kite account/session)
 # ─────────────────────────────────────────
@@ -369,8 +373,11 @@ def get_orb_for_day(df, date):
 # ─────────────────────────────────────────
 #   BACKTEST — identical logic to NIFTY, index-agnostic
 # ─────────────────────────────────────────
-def run_backtest(df5, df15, fut_vol):
-    print("Preparing indicators...")
+def run_backtest(df5, df15, fut_vol, candle_sl=False, target_pts=None, morning_only=False, ce_only=False):
+    mode  = "MORNING CE-ONLY" if (morning_only and ce_only) else ("MORNING" if morning_only else "REGULAR")
+    sl_lbl  = f"Candle SL ({CANDLE_SL_BUFFER}pt)" if candle_sl else "Fixed %"
+    tgt_lbl = f"{target_pts}pt" if target_pts else "Fixed %"
+    print(f"Preparing indicators... [{mode} | SL: {sl_lbl} | Target: {tgt_lbl}]")
     print(f"  ATR-based dynamic risk: {'ON' if USE_ATR_DYNAMIC else 'OFF (fixed %, proven baseline)'}")
     df5 = df5.copy()
     df5['EMA9']       = ema(df5['Close'],9)
@@ -425,7 +432,7 @@ def run_backtest(df5, df15, fut_vol):
             day_breakout_buffer = 0
         day_momentum_min = (MOMENTUM_ATR_MULT * atr) if USE_ATR_DYNAMIC else MOMENTUM_MIN
 
-        if t<TRADE_START or t>day_trade_end: continue
+        if t<TRADE_START or t>(dtime(11,0) if morning_only else day_trade_end): continue
         if daily_count.get(date,0)>=MAX_TRADES: continue
 
         price=float(row['Close'])
@@ -461,46 +468,61 @@ def run_backtest(df5, df15, fut_vol):
             breakout  = price > ph + day_breakout_buffer
             breakdown = price < pl - day_breakout_buffer
 
-        buy_t1  = all([price>vwap, st==True,  cross_up,   vol_spike, breakout])
-        sell_t1 = all([price<vwap, st==False, cross_down, vol_spike, breakdown])
-
-        if not buy_t1 and not sell_t1: continue
-        if is_doji: continue
-
-        if date not in pdhl_cache:
-            pdhl_cache[date] = get_prev_day_hl(df5, date)
-        pdh, pdl = pdhl_cache[date]
-
-        # Target distance — must match whichever mode (ATR or fixed%) is active,
-        # so the S&R filter checks against the SAME distance we'll actually use.
-        tgt_dist = (TARGET_ATR_MULT * atr) if USE_ATR_DYNAMIC else (price * TARGET_PCT)
-
-        if buy_t1:
-            if not (RSI_BUY_MIN<=rsi<=RSI_BUY_MAX): continue
-            if pdh and 0 < (pdh - price) < tgt_dist: continue
-            t2=sum([True, trend15==True, bull_clean, expiry_safe, orb_bull])
-            if t2<day_ce_min_t2: continue
-            if last_sig.get(date)=="BUY": continue
-            signal="BUY"
-            conf="HIGH" if t2==5 else ("NORMAL" if t2>=3 else "WEAK")
+        if morning_only:
+            # 4-condition morning entry: VWAP + ST + Prev-candle breakout + Clean candle
+            buy_ok  = all([price > vwap, st == True,  price > ph, bull_clean,  not is_doji])
+            sell_ok = all([price < vwap, st == False, price < pl, bear_clean, not is_doji])
+            if ce_only: sell_ok = False
+            if not buy_ok and not sell_ok: continue
+            signal = "BUY" if buy_ok else "SELL"
+            if last_sig.get(date) == signal: continue
+            conf = "NORMAL"; t2 = 4
+            tgt_dist = target_pts if target_pts else (price * TARGET_PCT)
         else:
-            if not (RSI_SELL_MIN<=rsi<=RSI_SELL_MAX): continue
-            if pdl and 0 < (price - pdl) < tgt_dist: continue
-            t2=sum([True, trend15==False, bear_clean, expiry_safe, orb_bear])
-            if t2<PE_MIN_T2: continue
-            if last_sig.get(date)=="SELL": continue
-            signal="SELL"
-            conf="HIGH" if t2==5 else ("NORMAL" if t2>=4 else "WEAK")
+            buy_t1  = all([price>vwap, st==True,  cross_up,   vol_spike, breakout])
+            sell_t1 = all([price<vwap, st==False, cross_down, vol_spike, breakdown])
 
-        if USE_ATR_DYNAMIC:
+            if not buy_t1 and not sell_t1: continue
+            if is_doji: continue
+
+            if date not in pdhl_cache:
+                pdhl_cache[date] = get_prev_day_hl(df5, date)
+            pdh, pdl = pdhl_cache[date]
+
+            # Target distance — must match whichever mode (ATR or fixed%) is active,
+            # so the S&R filter checks against the SAME distance we'll actually use.
+            tgt_dist = (TARGET_ATR_MULT * atr) if USE_ATR_DYNAMIC else (price * TARGET_PCT)
+
+            if buy_t1:
+                if not (RSI_BUY_MIN<=rsi<=RSI_BUY_MAX): continue
+                if pdh and 0 < (pdh - price) < tgt_dist: continue
+                t2=sum([True, trend15==True, bull_clean, expiry_safe, orb_bull])
+                if t2<day_ce_min_t2: continue
+                if last_sig.get(date)=="BUY": continue
+                signal="BUY"
+                conf="HIGH" if t2==5 else ("NORMAL" if t2>=3 else "WEAK")
+            else:
+                if not (RSI_SELL_MIN<=rsi<=RSI_SELL_MAX): continue
+                if pdl and 0 < (price - pdl) < tgt_dist: continue
+                t2=sum([True, trend15==False, bear_clean, expiry_safe, orb_bear])
+                if t2<PE_MIN_T2: continue
+                if last_sig.get(date)=="SELL": continue
+                signal="SELL"
+                conf="HIGH" if t2==5 else ("NORMAL" if t2>=4 else "WEAK")
+
+        if candle_sl:
+            sl      = (pl - CANDLE_SL_BUFFER) if signal=="BUY" else (ph + CANDLE_SL_BUFFER)
+            sl_dist = abs(price - sl)
+            be_dist = price * BREAKEVEN_PCT
+        elif USE_ATR_DYNAMIC:
             sl_dist = SL_ATR_MULT * atr
             be_dist = BE_ATR_MULT * atr
+            sl      = price - sl_dist if signal=="BUY" else price + sl_dist
         else:
             sl_dist = price * SL_PCT
             be_dist = price * BREAKEVEN_PCT
-        # tgt_dist already computed above (shared with the S&R filter check)
+            sl      = price - sl_dist if signal=="BUY" else price + sl_dist
 
-        sl     = price - sl_dist if signal=="BUY" else price + sl_dist
         target = price + tgt_dist if signal=="BUY" else price - tgt_dist
         be_lvl = price + be_dist if signal=="BUY" else price - be_dist
 
@@ -711,10 +733,10 @@ def print_report(trades):
 #   MAIN
 # ─────────────────────────────────────────
 def main():
-    print("="*55)
-    print("  SENSEX BACKTESTER v1.0 — proven NIFTY engine")
-    print("  CE(3/5) + PE(4/5) | 3 trades | 9:30-2:00 PM | Expiry: Thu")
-    print("="*55)
+    print("="*65)
+    print("  SENSEX BACKTESTER — Morning window CE-only (candle SL + target)")
+    print("  Same strategy as NIFTY morning | VWAP+ST+Breakout+Clean | 9:30-11:00")
+    print("="*65)
 
     if not login(): return
 
@@ -724,7 +746,7 @@ def main():
         print("❌ Could not find SENSEX token — aborting")
         return
 
-    DAYS = 100
+    DAYS = 60
     print(f"📥 Fetching Sensex 5 min data ({DAYS} days)...")
     df5=fetch_data(SENSEX_TOKEN,"5minute",days=DAYS,label="[5min spot]")
     if df5 is None or df5.empty:
@@ -748,10 +770,61 @@ def main():
     else:
         print("⚠️ No futures token — backtest will use spot volume")
 
-    print("\n🔍 Running backtest...")
-    trades=run_backtest(df5,df15,fut_vol)
-    print(f"✅ Done. Signals: {len(trades)}")
-    print_report(trades)
+    # ── Run all variants ──
+    print("\n[1/4] Regular window baseline (fixed SL, CE+PE, 9:30-14:00)...")
+    t_base = run_backtest(df5, df15, fut_vol)
+
+    print("\n[2/4] Morning CE-only, Candle SL + 50pt target (9:30-11:00)...")
+    t_50 = run_backtest(df5, df15, fut_vol, candle_sl=True, target_pts=50, morning_only=True, ce_only=True)
+
+    print("\n[3/4] Morning CE-only, Candle SL + 75pt target (9:30-11:00)...")
+    t_75 = run_backtest(df5, df15, fut_vol, candle_sl=True, target_pts=75, morning_only=True, ce_only=True)
+
+    print("\n[4/4] Morning CE-only, Candle SL + 100pt target (9:30-11:00)...")
+    t_100 = run_backtest(df5, df15, fut_vol, candle_sl=True, target_pts=100, morning_only=True, ce_only=True)
+
+    # ── Comparison table ──
+    def var_stats(trades_list):
+        if not trades_list: return 0, 0.0, 0, 0.0, 0
+        tdf = pd.DataFrame(trades_list)
+        wins = len(tdf[tdf['outcome'].isin(['TARGET','TRAIL'])])
+        sls  = len(tdf[tdf['outcome']=='SL'])
+        wr   = wins / len(tdf) * 100
+        net  = int(tdf['pnl_rs'].sum())
+        avg_sl = round(tdf['sl_pts'].mean(), 1)
+        return len(tdf), wr, sls, avg_sl, net
+
+    variants = [
+        ("Fixed SL  + orig target (regular 9:30-14:00)", t_base),
+        ("Candle SL + 50pt target (morning CE-only)",    t_50),
+        ("Candle SL + 75pt target (morning CE-only)",    t_75),
+        ("Candle SL + 100pt target (morning CE-only)",   t_100),
+    ]
+    all_pnl = [var_stats(t)[4] for _, t in variants]
+    best_pnl = max(all_pnl) if any(p > 0 for p in all_pnl) else None
+
+    SEP = "="*80
+    print(f"\n{SEP}")
+    print("  SENSEX — MORNING CANDLE SL vs REGULAR BASELINE")
+    print(f"  NIFTY morning uses 25pt target; SENSEX scaled ~3x (80k vs 24k spot)")
+    print(SEP)
+    print(f"  {'Variant':<47} {'Trades':>6} {'Win%':>5} {'SLs':>4} {'AvgSL':>7} {'Net P&L':>10}")
+    print(f"  {'-'*77}")
+    for label, t in variants:
+        n, wr, sls, avg_sl, net = var_stats(t)
+        star = " ★" if net == best_pnl else ""
+        print(f"  {label:<47} {n:>6} {wr:>4.1f}% {sls:>4} {avg_sl:>6.1f}pt  Rs{net:>8,}{star}")
+    print(SEP)
+
+    # ── Detailed report for best morning variant ──
+    morning_variants = [(t_50,50), (t_75,75), (t_100,100)]
+    best = max(morning_variants, key=lambda x: pd.DataFrame(x[0])['pnl_rs'].sum() if x[0] else 0)
+    best_trades, best_tgt = best
+    if best_trades:
+        print(f"\n{'='*55}")
+        print(f"  DETAILED: Morning CE-only, Candle SL + {best_tgt}pt target")
+        print(f"{'='*55}")
+        print_report(best_trades)
 
 if __name__=="__main__":
     main()

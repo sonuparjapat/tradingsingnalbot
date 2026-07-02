@@ -46,6 +46,9 @@ EXPIRY_WEEKDAY = 1   # Tuesday — skipped
 SL_PCT        = 0.00063   # ~15pts — keep same
 TARGET_PCT    = 0.00046   # ~11pts (morning is 0.00071 = 17pts)
 BREAKEVEN_PCT = 0.00025   # ~6pts  (scaled down proportionally)
+
+# Candle-structure SL (same concept as morning scanner winner)
+CANDLE_SL_BUFFER = 5      # spot pts above prev candle HIGH (for PE/SELL)
 MOMENTUM_MIN  = 5
 MOMENTUM_CANDLES = 3
 
@@ -243,7 +246,7 @@ def get_trend15_at(trend15_series, ts):
     return bool(candidates.iloc[-1])
 
 # ─── BACKTEST ───
-def run_backtest(df5, df15, days=60):
+def run_backtest(df5, df15, days=60, candle_sl=False, target_pts=None):
     print("Preparing indicators...")
     df5 = df5.copy()
     df5['VWAP']       = calculate_vwap(df5)
@@ -307,12 +310,17 @@ def run_backtest(df5, df15, days=60):
 
         last_sig[date] = signal
 
-        sl_dist  = price * SL_PCT
-        tgt_dist = price * TARGET_PCT
-        be_dist  = price * BREAKEVEN_PCT
+        if candle_sl:
+            # PE/SELL: SL above previous candle HIGH + buffer
+            sl      = ph + CANDLE_SL_BUFFER
+            sl_dist = abs(sl - price)
+        else:
+            sl_dist = price * SL_PCT
+            sl      = price - sl_dist if signal=="BUY" else price + sl_dist
 
-        sl     = price - sl_dist if signal=="BUY" else price + sl_dist
-        target = price + tgt_dist if signal=="BUY" else price - tgt_dist
+        tgt_dist = target_pts if target_pts is not None else price * TARGET_PCT
+        be_dist  = price * BREAKEVEN_PCT
+        target   = price + tgt_dist if signal=="BUY" else price - tgt_dist
 
         trail_trigger_dist = be_dist * TRAIL_TRIGGER_MULT
         trail_step_dist    = be_dist * TRAIL_STEP_MULT
@@ -500,10 +508,75 @@ def main():
     else:
         print("⚠️  15min data unavailable — trend filter disabled\n")
 
-    print("🔍 Running evening backtest...")
-    trades = run_backtest(df5, df15, days=DAYS)
-    print(f"✅ Done. Signals found: {len(trades)}")
-    print_report(trades, DAYS)
+    # ── All variants ──
+    # (label, candle_sl, target_pts)
+    variants = [
+        ("Fixed SL  + orig target (~11pt)",  False, None),
+        ("Candle SL + orig target (~11pt)",  True,  None),
+        ("Candle SL + 15pt target",          True,  15),
+        ("Candle SL + 20pt target",          True,  20),
+        ("Candle SL + 25pt target",          True,  25),
+    ]
+
+    def qv(trades):
+        if not trades: return (0, 0.0, 0, 0.0, 0)
+        tdf = pd.DataFrame(trades)
+        total = len(tdf); wins = len(tdf[tdf['outcome'].isin(['TARGET','TRAIL'])])
+        sls = len(tdf[tdf['outcome']=='SL']); net = tdf['pnl_rs'].sum()
+        asl = tdf['sl_pts'].mean() if 'sl_pts' in tdf.columns else 0
+        return (total, wins/total*100 if total else 0, sls, asl, net)
+
+    all_trades = {}
+    for label, csl, tgt in variants:
+        all_trades[label] = run_backtest(df5, df15, days=DAYS, candle_sl=csl, target_pts=tgt)
+
+    # ── Detailed report for baseline ──
+    print_report(all_trades[variants[0][0]], DAYS)
+
+    # ── Comparison table ──
+    sep = "="*70
+    print(f"\n{sep}")
+    print(f"  EVENING WINDOW — SL & TARGET COMPARISON ({DAYS} days)")
+    print(f"  Candle SL = prev candle HIGH + {CANDLE_SL_BUFFER}pt (dynamic, PE/SELL only)")
+    print(sep)
+    print(f"  {'Variant':<40} {'Trades':>6} {'Win%':>6} {'SLs':>4} {'AvgSL':>7} {'Net P&L':>10} {'Monthly':>10}")
+    print(f"  {'-'*87}")
+
+    best_net = max(qv(t)[4] for t in all_trades.values())
+    for label, csl, tgt in variants:
+        t, wr, sl, asl, net = qv(all_trades[label])
+        star = " ★" if net == best_net else ""
+        print(f"  {label:<40} {t:>6} {wr:>5.1f}% {sl:>4} {asl:>6.1f}pt {net:>10,.0f} {net/(DAYS/30):>10,.0f}{star}")
+
+    print(sep)
+
+    # ── Detailed report for winner ──
+    best_label = max(((lbl, qv(all_trades[lbl])[4]) for lbl, _, __ in variants), key=lambda x: x[1])[0]
+    best_idx   = [v[0] for v in variants].index(best_label)
+    _, best_csl, best_tgt = variants[best_idx]
+
+    if best_label != variants[0][0]:
+        print(f"\n  ★ BEST VARIANT: {best_label}")
+        print(f"{'='*70}")
+        print_report(all_trades[best_label], DAYS)
+
+    # ── Final verdict ──
+    base_net = qv(all_trades[variants[0][0]])[4]; base_wr = qv(all_trades[variants[0][0]])[1]
+    best_net2= qv(all_trades[best_label])[4];      best_wr2= qv(all_trades[best_label])[1]
+
+    print(f"\n{sep}")
+    print(f"  FINAL VERDICT — EVENING WINDOW")
+    print(sep)
+    print(f"  Baseline (current live) : {base_wr:.1f}% win | ₹{base_net:,.0f} / 60d")
+    print(f"  Best candle SL variant  : {best_wr2:.1f}% win | ₹{best_net2:,.0f} / 60d  [{best_label}]")
+    if best_net2 > base_net and best_wr2 >= base_wr:
+        print(f"\n  ✅ SWITCH — candle SL + {best_tgt if best_tgt else '~11'}pt target is BETTER")
+        print(f"     Extra profit: ₹{best_net2-base_net:,.0f} (+{(best_net2-base_net)/abs(base_net)*100:.0f}%) | Win: {best_wr2:.1f}% vs {base_wr:.1f}%")
+    elif best_wr2 > base_wr:
+        print(f"\n  ✅ Candle SL has BETTER WIN RATE | P&L: {'better' if best_net2>base_net else 'lower'}")
+    else:
+        print(f"\n  ❌ KEEP current — candle SL did not improve evening window")
+    print(sep)
 
 if __name__ == "__main__":
     main()

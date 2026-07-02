@@ -41,6 +41,9 @@ NIFTY_TOKEN = 256265
 SL_PCT      = 0.00063   # ~15 pts SL
 TARGET_PCT  = 0.00071   # ~17 pts target
 BREAKEVEN_PCT = 0.00034 # ~8 pts — move SL to entry (saves Jun 10/12 trades)
+
+# Candle-structure SL (same as morning scanner winner: 90.5% win rate)
+CANDLE_SL_BUFFER = 5    # spot pts beyond previous candle low/high
 MOMENTUM_CANDLES = 3    # check momentum after 3 candles (15 min)
 MOMENTUM_MIN = 5        # must be +5pts in favor, else exit early
 MAX_TRADES  = 3
@@ -358,7 +361,7 @@ def get_orb_for_day(df, date):
 # ─────────────────────────────────────────
 #   BACKTEST
 # ─────────────────────────────────────────
-def run_backtest(df5, df15, fut_vol):
+def run_backtest(df5, df15, fut_vol, candle_sl=False, target_pts=None):
     print("Preparing indicators...")
     print(f"  ATR-based dynamic risk: {'ON' if USE_ATR_DYNAMIC else 'OFF (fixed %, proven baseline)'}")
     df5 = df5.copy()
@@ -458,9 +461,13 @@ def run_backtest(df5, df15, fut_vol):
             pdhl_cache[date] = get_prev_day_hl(df5, date)
         pdh, pdl = pdhl_cache[date]
 
-        # Target distance — must match whichever mode (ATR or fixed%) is active,
-        # so the S&R filter checks against the SAME distance we'll actually use.
-        tgt_dist = (TARGET_ATR_MULT * atr) if USE_ATR_DYNAMIC else (price * TARGET_PCT)
+        # Target distance — must match whichever mode is active (S&R filter uses same value)
+        if target_pts is not None:
+            tgt_dist = target_pts
+        elif USE_ATR_DYNAMIC:
+            tgt_dist = TARGET_ATR_MULT * atr
+        else:
+            tgt_dist = price * TARGET_PCT
 
         if buy_t1:
             if not (RSI_BUY_MIN<=rsi<=RSI_BUY_MAX): continue
@@ -481,17 +488,21 @@ def run_backtest(df5, df15, fut_vol):
             signal="SELL"
             conf="HIGH" if t2==5 else ("NORMAL" if t2>=4 else "WEAK")
 
-        if USE_ATR_DYNAMIC:
+        if candle_sl:
+            sl      = (pl - CANDLE_SL_BUFFER) if signal=="BUY" else (ph + CANDLE_SL_BUFFER)
+            sl_dist = abs(price - sl)
+            be_dist = price * BREAKEVEN_PCT
+        elif USE_ATR_DYNAMIC:
             sl_dist = SL_ATR_MULT * atr
             be_dist = BE_ATR_MULT * atr
+            sl      = price - sl_dist if signal=="BUY" else price + sl_dist
         else:
             sl_dist = price * SL_PCT
             be_dist = price * BREAKEVEN_PCT
-        # tgt_dist already computed above (shared with the S&R filter check)
+            sl      = price - sl_dist if signal=="BUY" else price + sl_dist
 
-        sl     = price - sl_dist if signal=="BUY" else price + sl_dist
         target = price + tgt_dist if signal=="BUY" else price - tgt_dist
-        be_lvl = price + be_dist if signal=="BUY" else price - be_dist
+        be_lvl = price + be_dist  if signal=="BUY" else price - be_dist
 
         sl_pts  = round(abs(price - sl), 1)
         tgt_pts = round(abs(target - price), 1)
@@ -735,10 +746,53 @@ def main():
             print("⚠️ Futures volume empty")
             fut_vol=None
 
-    print("\n🔍 Running backtest...")
-    trades=run_backtest(df5,df15,fut_vol)
-    print(f"✅ Done. Signals: {len(trades)}")
-    print_report(trades)
+    # ── Baseline: current live strategy ──
+    print("\n🔍 Running backtest [BASELINE — fixed SL ~15pt, target ~17pt]...")
+    trades_base = run_backtest(df5, df15, fut_vol, candle_sl=False, target_pts=None)
+    print(f"✅ Done. Signals: {len(trades_base)}")
+    print_report(trades_base)
+
+    # ── Test: candle SL + 25pt target (morning window winner) ──
+    print("\n🔍 Running backtest [TEST — candle SL prev low/high ±5pt + 25pt target]...")
+    trades_csl = run_backtest(df5, df15, fut_vol, candle_sl=True,  target_pts=25)
+    print(f"✅ Done. Signals: {len(trades_csl)}")
+    print_report(trades_csl)
+
+    # ── Side-by-side summary ──
+    def qs(trades):
+        if not trades: return (0, 0.0, 0, 0.0, 0)
+        tdf = pd.DataFrame(trades)
+        total = len(tdf); wins = len(tdf[tdf['outcome'].isin(['TARGET','TRAIL'])])
+        sls = len(tdf[tdf['outcome']=='SL']); net = tdf['pnl_rs'].sum()
+        asl = tdf['sl_pts'].mean() if 'sl_pts' in tdf.columns else 0
+        return (total, wins/total*100, sls, asl, net)
+
+    tb, wrb, slb, aslb, netb = qs(trades_base)
+    tc, wrc, slc, aslc, netc = qs(trades_csl)
+    sep = "="*65
+    arrow = lambda a, b: "🟢" if b > a else ("🔴" if b < a else "⚪")
+    print(f"\n{sep}")
+    print(f"  REGULAR WINDOW — Fixed SL vs Candle SL + 25pt target")
+    print(sep)
+    print(f"  {'':38} {'Baseline':>12}  {'Candle SL 25pt':>14}")
+    print(f"  {'-'*65}")
+    print(f"  {'Trades':<38} {tb:>12}  {tc:>14}  {arrow(tb, tc)}")
+    print(f"  {'Win rate':<38} {wrb:>11.1f}%  {wrc:>13.1f}%  {arrow(wrb, wrc)}")
+    print(f"  {'SL hits':<38} {slb:>12}  {slc:>14}  {arrow(slc, slb)}")
+    print(f"  {'Avg SL (pts)':<38} {aslb:>10.1f}pt  {aslc:>12.1f}pt")
+    print(f"  {'Net P&L ({DAYS}d)':<38} ₹{netb:>10,.0f}  ₹{netc:>12,.0f}  {arrow(netb, netc)}")
+    print(f"  {'Monthly estimate':<38} ₹{netb/(DAYS/30):>10,.0f}  ₹{netc/(DAYS/30):>12,.0f}  {arrow(netb/(DAYS/30), netc/(DAYS/30))}")
+    print(sep)
+    if netc > netb and wrc >= wrb:
+        print(f"  ✅ Candle SL + 25pt BETTER on ALL metrics — consider switching")
+        print(f"     Extra profit: ₹{netc-netb:,.0f} (+{(netc-netb)/abs(netb)*100:.1f}%) | Win: {wrc:.1f}% vs {wrb:.1f}%")
+    elif wrc > wrb:
+        print(f"  ✅ Candle SL has BETTER WIN RATE  |  P&L: {'higher' if netc > netb else 'lower'}")
+    elif netc > netb:
+        print(f"  ✅ Candle SL has HIGHER P&L  |  Win rate: {'higher' if wrc > wrb else 'lower'}")
+    else:
+        print(f"  ❌ Baseline is better — candle SL did not improve regular window")
+    print(sep)
 
 if __name__=="__main__":
     main()
