@@ -60,8 +60,8 @@ TARGET_PCT    = 0.00046   # ~11 pts (morning is 0.00071 ~17 pts)
 BREAKEVEN_PCT = 0.00025   # ~6 pts
 
 # RSI guard — prevents entering on extreme RSI (only safe PE zone)
-RSI_SELL_MIN = 35
-RSI_SELL_MAX = 55
+RSI_SELL_MIN = 38
+RSI_SELL_MAX = 52
 
 # Theta scaled haircut (shown in alert for awareness)
 THETA_EARLY  = 0.15   # 15% haircut at 1:00 PM
@@ -251,7 +251,7 @@ def run_remote_backtest(days):
         msg = (
             f"📊 <b>EVENING BACKTEST {days}d</b>\n\n"
             f"Window: 13:00-14:30 | PE/SELL only\n"
-            f"Conditions: VWAP + ST + 15min bearish + Breakdown + Bear candle + RSI(35-55)\n"
+            f"Conditions: VWAP + ST + 5min EMA bearish + 15min bearish + Breakdown + Bear candle + RSI(38-52)\n"
             f"Period: {tdf['date'].iloc[0]} → {tdf['date'].iloc[-1]}\n"
             f"Days with signals: {days_w}\n\n"
             f"<b>Total Signals: {total}</b>\n"
@@ -292,8 +292,8 @@ def process_telegram_commands():
                 "📊 <b>Evening Scanner Status</b>\n\n"
                 "🌆 SIGNAL-ONLY — never places real orders\n"
                 f"⏰ Active window: {EVENING_START.strftime('%H:%M')}-{EVENING_END.strftime('%H:%M')}\n"
-                "📉 PE/SELL only [TIGHT MODE] — 0 SL in 60-day backtest\n"
-                "6 conditions: VWAP + Supertrend + 15min bearish + Breakdown + Bear candle + RSI(35-55)\n"
+                "📉 PE/SELL only [TIGHT MODE]\n"
+                "7 conditions: VWAP + ST + 5min EMA bearish + 15min bearish + Breakdown + Bear candle + RSI(38-52)\n"
                 f"⏳ Theta haircut now: ~{theta_pct}% (scales 15%→25% through window)\n"
                 "Skip: Tuesday (expiry) + Friday"
             )
@@ -410,7 +410,7 @@ def get_15min_trend(df15):
     df15['EMA20'] = df15['Close'].ewm(span=20, adjust=False).mean()
     return bool(df15['EMA9'].iloc[-1] > df15['EMA20'].iloc[-1])
 
-# ─── SIGNAL ENGINE — PE/SELL only, 6 conditions (tight mode) ───
+# ─── SIGNAL ENGINE — PE/SELL only, 7 conditions (tight mode) ───
 def check_signals_evening(df5, df15=None):
     if len(df5) < 30:
         return None, None, None
@@ -419,7 +419,9 @@ def check_signals_evening(df5, df15=None):
     df5['VWAP']       = calculate_vwap(df5)
     df5['Supertrend'] = calculate_supertrend(df5)
     df5['RSI']        = calculate_rsi(df5['Close'])
-    df5 = df5.dropna(subset=['VWAP', 'RSI'])
+    df5['EMA9']       = df5['Close'].ewm(span=9,  adjust=False).mean()
+    df5['EMA20']      = df5['Close'].ewm(span=20, adjust=False).mean()
+    df5 = df5.dropna(subset=['VWAP', 'RSI', 'EMA20'])
     if len(df5) < 2:
         return None, None, None
 
@@ -429,6 +431,7 @@ def check_signals_evening(df5, df15=None):
     vwap = float(curr['VWAP'])
     st   = bool(curr['Supertrend'])
     rsi  = float(curr['RSI'])
+    ema9  = float(curr['EMA9']); ema20 = float(curr['EMA20'])
     ph   = float(prev['High']); pl = float(prev['Low'])
 
     is_doji, bull_clean, bear_clean = analyze_candle(o, h, l, c)
@@ -437,19 +440,23 @@ def check_signals_evening(df5, df15=None):
 
     breakdown   = price < pl
     rsi_ok_sell = RSI_SELL_MIN <= rsi <= RSI_SELL_MAX
+    ema_bearish = ema9 < ema20       # 5-min EMA confirms downtrend
     t15         = get_15min_trend(df15)   # must be bearish (False) to proceed
     t15_bearish = (t15 == False)          # None or True both block the trade
 
-    sell_ok = all([price < vwap, st == False, breakdown, bear_clean, rsi_ok_sell, t15_bearish])
+    sell_ok = all([price < vwap, st == False, ema_bearish, breakdown, bear_clean, rsi_ok_sell, t15_bearish])
 
     info = {
         "vwap":       vwap,
         "st":         st,
         "rsi":        rsi,
+        "ema9":       ema9,
+        "ema20":      ema20,
         "t15":        t15,
         "bear_clean": bear_clean,
         "cond_vwap":  price < vwap,
         "cond_st":    st == False,
+        "cond_ema":   ema_bearish,
         "cond_brk":   breakdown,
         "cond_clean": bear_clean,
         "cond_rsi":   rsi_ok_sell,
@@ -473,25 +480,28 @@ def send_market_status(price, info, alerts_today):
     theta_pct = round(theta * 100)
 
     if info and price:
-        vwap = info.get("vwap", 0)
-        rsi  = info.get("rsi", 0)
-        t15  = info.get("t15")
+        vwap  = info.get("vwap", 0)
+        rsi   = info.get("rsi", 0)
+        ema9  = info.get("ema9", 0)
+        ema20 = info.get("ema20", 0)
+        t15   = info.get("t15")
         t15_label = "Bearish ✅" if t15 == False else ("Bullish ❌" if t15 == True else "N/A ❌")
-        score = sum(1 for k in ['cond_vwap', 'cond_st', 'cond_brk', 'cond_clean', 'cond_rsi', 'cond_t15']
+        score = sum(1 for k in ['cond_vwap', 'cond_st', 'cond_ema', 'cond_brk', 'cond_clean', 'cond_rsi', 'cond_t15']
                     if info.get(k))
         msg = (
             f"🌡️ <b>Evening Window — {now.strftime('%H:%M')}</b>\n\n"
             f"NIFTY: <b>{price:.1f}</b>   VWAP: {vwap:.1f}\n"
             f"⏳ Theta haircut now: ~{theta_pct}% (15%→25% across window)\n\n"
-            f"<b>Signal conditions ({score}/6):</b>\n"
+            f"<b>Signal conditions ({score}/7):</b>\n"
             f"  {ck(info.get('cond_vwap'))}  Price below VWAP\n"
             f"  {ck(info.get('cond_st'))}  Supertrend RED (downtrend)\n"
+            f"  {ck(info.get('cond_ema'))}  5-min EMA9({ema9:.0f}) < EMA20({ema20:.0f})\n"
             f"  {ck(info.get('cond_brk'))}  Breakdown vs prev candle\n"
             f"  {ck(info.get('cond_clean'))}  Bear clean candle\n"
             f"  {ck(info.get('cond_rsi'))}  RSI: {rsi:.1f} (need {RSI_SELL_MIN}-{RSI_SELL_MAX})\n"
             f"  {ck(info.get('cond_t15'))}  15-min trend: {t15_label}\n\n"
             f"Alerts fired today: {alerts_today}/{MAX_ALERTS}\n"
-            f"<i>PE signal fires when all 6 ✅</i>"
+            f"<i>PE signal fires when all 7 ✅</i>"
         )
     else:
         msg = (
@@ -544,9 +554,10 @@ def format_alert(price, info, alert_num):
 🔢 Alert #{alert_num}/{MAX_ALERTS}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-<b>All 6 conditions ✅ [TIGHT MODE]</b>
+<b>All 7 conditions ✅ [TIGHT MODE]</b>
   ✅ Price below VWAP (bearish bias)
   ✅ Supertrend RED (downtrend)
+  ✅ 5-min EMA9 &lt; EMA20 (short-term bearish)
   ✅ Breakdown vs prev candle
   ✅ Bear clean candle (body &gt; tail)
   ✅ RSI: {rsi:.1f} (range {RSI_SELL_MIN}-{RSI_SELL_MAX})
@@ -562,7 +573,7 @@ def run_scanner():
     print("=" * 55)
     print("  NIFTY EVENING SCANNER — PE/SELL ONLY  [TIGHT MODE]")
     print(f"  Window: {EVENING_START.strftime('%H:%M')}-{EVENING_END.strftime('%H:%M')}")
-    print("  6 conditions: VWAP + ST + 15min bearish + Breakdown + Clean candle + RSI(35-55)")
+    print("  7 conditions: VWAP + ST + 5min EMA bearish + 15min bearish + Breakdown + Clean candle + RSI(38-52)")
     print("  Skip: Tuesday (expiry) + Friday")
     print("  NEVER places real orders — separate from all other bots")
     print("=" * 55)
@@ -572,9 +583,9 @@ def run_scanner():
     send_telegram(
         "🌆 <b>Evening Scanner Started</b>\n\n"
         f"Window: {EVENING_START.strftime('%H:%M')}-{EVENING_END.strftime('%H:%M')} only\n"
-        "🔴 PE/SELL only [TIGHT MODE] — 0 SL in 60-day backtest\n"
+        "🔴 PE/SELL only [TIGHT MODE]\n"
         "SIGNAL-ONLY — separate from main bot + morning scanner, never trades\n"
-        "6 conditions: VWAP + ST + 15min bearish + Breakdown + Clean candle + RSI(35-55)\n"
+        "7 conditions: VWAP + ST + 5min EMA bearish + 15min bearish + Breakdown + Clean candle + RSI(38-52)\n"
         "⏳ Theta haircut: 15% at 1 PM → 25% at 2 PM (shown in each alert)\n"
         "Skip days: Tuesday (expiry) + Friday\n\n"
         "Send /evening_help for commands"
@@ -614,7 +625,7 @@ def run_scanner():
                 send_telegram(
                     f"🌆 <b>Evening Window OPEN</b>\n\n"
                     f"⏰ {now.strftime('%H:%M')} — Scanning till {EVENING_END.strftime('%H:%M')}\n"
-                    f"📉 PE/SELL only [TIGHT] | 6 conditions: VWAP + ST + 15min bearish + Breakdown + Clean + RSI\n"
+                    f"📉 PE/SELL only [TIGHT] | 7 conditions: VWAP + ST + 5min EMA bearish + 15min bearish + Breakdown + Clean + RSI(38-52)\n"
                     f"⏳ Theta haircut: ~{round(theta*100)}% (rises to 25% by 2 PM)"
                 )
 

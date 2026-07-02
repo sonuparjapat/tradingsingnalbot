@@ -3,7 +3,8 @@
 NIFTY EVENING BACKTEST — 13:00-14:30 Window
 =============================================================
 Evening window: market already trending, VWAP well-established.
-Signal: VWAP + Supertrend + 15min trend + RSI + Breakout + Clean candle.
+Signal: VWAP + Supertrend + 5min EMA bearish + 15min trend + RSI + Breakdown + Clean candle.
+7 conditions for high-quality PE entries only.
 Extra caution: theta decay applies to ALL trades (1-2.5 hrs left).
   Early entries (1:00 PM): 15% haircut — more time remaining.
   Late entries  (2:00 PM+): 25% haircut — theta accelerates near close.
@@ -50,7 +51,7 @@ MOMENTUM_CANDLES = 3
 
 # RSI guard — prevents overbought BUY / oversold SELL
 RSI_BUY_MIN  = 45;  RSI_BUY_MAX  = 65
-RSI_SELL_MIN = 35;  RSI_SELL_MAX = 55
+RSI_SELL_MIN = 38;  RSI_SELL_MAX = 52
 
 # Theta haircut — scaled by entry time (more time = less haircut)
 # 1:00 PM entry: ~2.5 hrs left → 15%
@@ -248,7 +249,9 @@ def run_backtest(df5, df15, days=60):
     df5['VWAP']       = calculate_vwap(df5)
     df5['Supertrend'] = calculate_supertrend(df5)
     df5['RSI']        = calculate_rsi(df5['Close'])
-    df5 = df5.dropna(subset=['VWAP','RSI'])
+    df5['EMA9']       = ema(df5['Close'], 9)
+    df5['EMA20']      = ema(df5['Close'], 20)
+    df5 = df5.dropna(subset=['VWAP','RSI','EMA20'])
 
     trend15 = None
     if df15 is not None and len(df15) >= 25:
@@ -275,6 +278,7 @@ def run_backtest(df5, df15, days=60):
         vwap  = float(row['VWAP'])
         st    = bool(row['Supertrend'])
         rsi   = float(row['RSI'])
+        ema9  = float(row['EMA9']); ema20 = float(row['EMA20'])
         ph    = float(prev['High']); pl = float(prev['Low'])
 
         is_doji, bull_clean, bear_clean = analyze_candle(o,h,l,c)
@@ -288,10 +292,11 @@ def run_backtest(df5, df15, days=60):
 
         rsi_ok_buy  = RSI_BUY_MIN  <= rsi <= RSI_BUY_MAX
         rsi_ok_sell = RSI_SELL_MIN <= rsi <= RSI_SELL_MAX
+        ema_bear    = ema9 < ema20   # 5-min EMA confirms downtrend
 
         buy_ok  = False   # CE disabled in evening — afternoon favours PE
-        # 15-min must also be bearish — filters choppy entries, gives 0 SL in backtests
-        sell_ok = all([price<vwap, st==False, breakdown, bear_clean, rsi_ok_sell, t15==False])
+        # 7 conditions: VWAP + ST + 5min EMA bearish + 15min bearish + RSI(38-52) + Breakdown + Clean
+        sell_ok = all([price<vwap, st==False, ema_bear, breakdown, bear_clean, rsi_ok_sell, t15==False])
 
         if buy_ok and last_sig.get(date) != "BUY":
             signal = "BUY"
@@ -404,8 +409,8 @@ def print_report(trades, days):
 
     print(f"\n{sep}")
     print(f"  NIFTY EVENING BACKTEST — 13:00-14:30 Window  [TIGHT MODE]")
-    print(f"  Signal: VWAP + Supertrend + 15min bearish + RSI(35-55) + Breakdown + Clean candle")
-    print(f"  PE/SELL only | 15-min trend must confirm bearish direction")
+    print(f"  Signal: VWAP + ST + 5min EMA bearish + 15min bearish + RSI(38-52) + Breakdown + Clean")
+    print(f"  PE/SELL only | 7 conditions | Both 5-min & 15-min must confirm bearish")
     print(f"  Theta: {THETA_EARLY*100:.0f}% at 1PM → {THETA_LATE*100:.0f}% at 2PM (scaled)")
     print(f"  Exits: SL/Target/Breakeven/Trailing/Hard exit 3:10 PM")
     print(f"  P&L: delta+theta premium model, LOT_SIZE={LOT_SIZE}")
@@ -474,7 +479,7 @@ def main():
     print("="*60)
     print("  NIFTY EVENING BACKTEST  [TIGHT MODE]")
     print("  Window: 13:00-14:30 | PE/SELL only")
-    print("  6 conditions: VWAP + Supertrend + 15min BEARISH + RSI(35-55) + Breakdown + Clean")
+    print("  7 conditions: VWAP + ST + 5min EMA bearish + 15min BEARISH + RSI(38-52) + Breakdown + Clean")
     print(f"  Theta: {THETA_EARLY*100:.0f}% (1PM) → {THETA_LATE*100:.0f}% (2PM) scaled")
     print("  Skip: Tuesday (expiry) + Friday")
     print("="*60)
