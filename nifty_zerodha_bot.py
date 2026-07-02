@@ -225,11 +225,15 @@ def login():
 def send_telegram(msg):
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print(f"\n{'='*50}\n[TG]\n{msg}\n{'='*50}"); return
-    try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id":CHAT_ID,"text":msg,"parse_mode":"HTML"}, timeout=10)
-    except Exception as e:
-        print(f"TG error: {e}")
+    for attempt in range(3):
+        try:
+            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id":CHAT_ID,"text":msg,"parse_mode":"HTML"}, timeout=10)
+            return
+        except Exception as e:
+            print(f"TG error (attempt {attempt+1}/3): {e}")
+            if attempt < 2:
+                time.sleep(3)
 
 def send_telegram_document(file_path, caption=""):
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
