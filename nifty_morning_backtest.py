@@ -83,6 +83,12 @@ TRAIL_TRIGGER_MULT = 1.5
 TRAIL_STEP_MULT_ATM = 0.6        # ATM mode — original
 TRAIL_STEP_MULT_ITM = 0.35       # ITM mode — tighter, keeps more profit on trail exits
 
+# Wick + RSI mode constants
+WICK_THRESHOLD_PT  = 10   # prev candle wick > this → use extra breakout buffer
+WICK_BREAKOUT_BUF  = 4    # extra pts needed beyond prev high/low when big wick present
+RSI_OVERBOUGHT     = 70   # RSI above this → overbought → avoid CE, look for PE
+RSI_OVERSOLD       = 30   # RSI below this → oversold → avoid PE, look for CE
+
 # ─── LOGIN ───
 kite = KiteConnect(api_key=API_KEY)
 TOKEN_FILE = "kite_token.json"
@@ -257,7 +263,8 @@ def estimate_premium_pts(entry_price, exit_price, signal, is_expiry_day, delta_b
 
 # ─── BACKTEST ───
 def run_backtest(df5, df15=None, days=60, mode="ATM", ce_only=False, candle_sl=False,
-                 target_pts=None, candle_be_trigger_pts=None):
+                 target_pts=None, candle_be_trigger_pts=None, entry_end=None,
+                 entry_windows=None, skip_expiry=True, tue_windows=None):
     """
     mode='ATM'      : 4-condition, delta 0.5, entry 9:30 (CE+PE)
     mode='SOLID'    : 5-condition, delta 0.5, entry 9:35, CE-only
@@ -271,7 +278,8 @@ def run_backtest(df5, df15=None, days=60, mode="ATM", ce_only=False, candle_sl=F
     use_rsi         = (mode == "ITM")
     is_solid        = (mode == "SOLID")
     is_solid_pe     = (mode == "SOLID_PE")
-    if is_solid: ce_only = True          # SOLID is always CE-only
+    is_wick_rsi     = (mode == "WICK_RSI")
+    if is_solid: ce_only = True
     trail_step_mult = TRAIL_STEP_MULT_ITM if mode == "ITM" else TRAIL_STEP_MULT_ATM
     trend15         = build_trend15(df15) if (df15 is not None and is_solid_pe) else None
 
@@ -301,15 +309,22 @@ def run_backtest(df5, df15=None, days=60, mode="ATM", ce_only=False, candle_sl=F
         row = df5.iloc[i]; prev = df5.iloc[i-1]
         ts  = df5.index[i]; date = ts.date(); t = ts.time()
 
-        if t < ENTRY_START or t > ENTRY_END: continue
-        if ts.weekday() == EXPIRY_WEEKDAY: continue
+        is_tuesday = (ts.weekday() == EXPIRY_WEEKDAY)
+        if skip_expiry and is_tuesday: continue
+        # Use tue_windows for Tuesday if provided, otherwise normal entry_windows
+        active_windows = (tue_windows if (is_tuesday and tue_windows is not None) else entry_windows)
+        if active_windows is not None:
+            if not any(ws <= t <= we for ws, we in active_windows): continue
+        else:
+            eff_entry_end = entry_end if entry_end is not None else ENTRY_END
+            if t < ENTRY_START or t > eff_entry_end: continue
 
         # ITM mode: only enter AFTER Opening Range is established (9:45+)
         if use_rsi and t < ENTRY_SKIP_UNTIL: continue
         # SOLID / SOLID_PE: skip first candle (9:30 opening volatility is highest)
         if (is_solid or is_solid_pe) and t < dtime(9, 35): continue
 
-        is_expiry = (ts.weekday() == EXPIRY_WEEKDAY)
+        is_expiry = is_tuesday
 
         price = float(row['Close'])
         o,h,l,c = float(row['Open']),float(row['High']),float(row['Low']),float(row['Close'])
@@ -351,6 +366,34 @@ def run_backtest(df5, df15=None, days=60, mode="ATM", ce_only=False, candle_sl=F
             ema_bear = ema9 < ema20
             buy_ok  = all([price>vwap, st==True,  breakout,  bull_clean, rsi >= RSI_BUY_MIN,  ema_bull])
             sell_ok = all([price<vwap, st==False, breakdown, bear_clean, rsi <= RSI_SELL_MAX, ema_bear])
+        elif is_wick_rsi:
+            # WICK_RSI: wick-aware breakout + RSI extremes for CE+PE
+            #
+            # Wick logic:
+            #   prev upper wick = prev_H - max(prev_O, prev_C)
+            #   if large (>10pt) → market got rejected there → need +4pt extra to confirm real breakout
+            #   prev lower wick = min(prev_O, prev_C) - prev_L
+            #   if large (>10pt) → strong support seen → need -4pt extra below that low to confirm breakdown
+            #
+            # RSI logic:
+            #   RSI > 70 (overbought) → stretched up → avoid CE (likely to reverse), look for PE
+            #   RSI < 30 (oversold)   → stretched down → avoid PE (likely to bounce), look for CE
+            #   RSI 30-70             → neutral → both CE and PE allowed by conditions
+
+            prev_o = float(prev['Open']); prev_c = float(prev['Close'])
+            prev_uw = ph - max(prev_o, prev_c)   # prev candle upper wick
+            prev_lw = min(prev_o, prev_c) - pl    # prev candle lower wick
+
+            ce_buf = WICK_BREAKOUT_BUF if prev_uw > WICK_THRESHOLD_PT else 0
+            pe_buf = WICK_BREAKOUT_BUF if prev_lw > WICK_THRESHOLD_PT else 0
+
+            breakout  = price > ph + ce_buf   # if prev had big upper wick, need extra buffer
+            breakdown = price < pl - pe_buf   # if prev had big lower wick, need extra buffer
+
+            # CE: 4 conditions + RSI not overbought (RSI>70 = stretched, bad CE entry)
+            buy_ok  = all([price > vwap, st == True,  breakout,  bull_clean, rsi < RSI_OVERBOUGHT])
+            # PE: mirror 4 conditions + RSI not oversold (RSI<30 = stretched down, bad PE entry)
+            sell_ok = all([price < vwap, st == False, breakdown, bear_clean, rsi > RSI_OVERSOLD])
         else:
             # ATM: 4 conditions (original, CE+PE)
             breakout  = price > ph
@@ -486,7 +529,12 @@ def print_report(trades, days, mode="ATM", ce_only=False, candle_sl=False, targe
     days_traded = len(set(tdf['date']))
     sep = "="*70
 
-    if mode == "SOLID":
+    if mode == "WICK_RSI":
+        title   = "NIFTY MORNING BACKTEST — 09:30-11:00  [WICK+RSI — CE+PE, WICK-AWARE]"
+        cond    = (f"CE: VWAP+ST+Breakout(+{WICK_BREAKOUT_BUF}pt if prev wick>{WICK_THRESHOLD_PT}pt)+Clean+RSI<{RSI_OVERBOUGHT}  |  "
+                   f"PE: mirror+RSI>{RSI_OVERSOLD}")
+        delta_s = f"ATM | Delta ~{DELTA_ATM} | Wick buffer: +{WICK_BREAKOUT_BUF}pt when prev wick>{WICK_THRESHOLD_PT}pt"
+    elif mode == "SOLID":
         title   = "NIFTY MORNING BACKTEST — 09:35-11:00  [SOLID — CE-only, 5 CONDITIONS]"
         cond    = "VWAP + ST + EMA9>EMA20 + Breakout(+3pt) + Bull clean | CE-only | Skip 9:30"
         delta_s = f"ATM | Delta ~{DELTA_ATM} | Strong breakout only (+{MIN_BREAKOUT_PTS}pt)"
@@ -663,111 +711,117 @@ def main():
     if not login(): return
 
     DAYS = 60
+    LIVE_WIN = [(dtime(9, 30), dtime(13, 0))]   # current live window
+
     print(f"Fetching {DAYS} days of Nifty 5-min data...")
     df5 = fetch_data(NIFTY_TOKEN, "5minute", days=DAYS)
     if df5 is None or df5.empty:
         print("Failed to fetch data"); return
     print(f"  {len(df5)} candles | {df5.index[0].date()} to {df5.index[-1].date()}\n")
 
-    # ── All variants to test ──
-    # (label, candle_sl, target_pts, ce_only)
-    variants = [
-        ("Fixed SL  + orig target (~17pt)",  False, None, True),
-        ("Candle SL + orig target (~17pt)",  True,  None, True),
-        ("Candle SL + 25pt target",          True,  25,   True),
-        ("Candle SL + 30pt target",          True,  30,   True),
-        ("Candle SL + 35pt target",          True,  35,   True),
-        ("Candle SL + 25pt  CE+PE both",     True,  25,   False),
-    ]
-
-    all_trades = {}
-    for label, csl, tgt, ceo in variants:
-        all_trades[label] = run_backtest(df5, days=DAYS, mode="ATM", ce_only=ceo,
-                                         candle_sl=csl, target_pts=tgt)
-
-    # ── Detailed report: baseline (for reference) ──
-    print_report(all_trades[variants[0][0]], days=DAYS, mode="ATM", ce_only=True,
-                 candle_sl=False, target_pts=None)
-
-    # ── Detailed report: confirmed live strategy (candle SL + 25pt) ──
-    print(f"\n{'='*70}")
-    print(f"  ★ LIVE STRATEGY — Candle SL + 25pt target")
-    print(f"{'='*70}")
-    print_report(all_trades["Candle SL + 25pt target"], days=DAYS, mode="ATM",
-                 ce_only=True, candle_sl=True, target_pts=25)
-
-    # ── BIG COMPARISON TABLE ──
     def qv(trades):
-        if not trades: return (0, 0.0, 0, 0, 0, 0.0)
+        if not trades: return (0, 0.0, 0, 0, 0, 0.0, 0.0)
         tdf = pd.DataFrame(trades)
         total = len(tdf)
         wins  = len(tdf[tdf['outcome'].isin(['TARGET','TRAIL'])])
         sls   = len(tdf[tdf['outcome']=='SL'])
+        bes   = len(tdf[tdf['outcome']=='BE'])
         net   = tdf['pnl_rs'].sum()
         avg_sl= tdf['sl_pts'].mean() if 'sl_pts' in tdf.columns else 0
-        return (total, wins/total*100 if total else 0, sls, net, net/(DAYS/30), avg_sl)
+        return (total, wins/total*100 if total else 0, sls, bes, net, net/(DAYS/30), avg_sl)
 
-    sep = "="*70
+    MORN_ONLY_WIN = [(dtime(9, 30), dtime(11, 0))]   # Tuesday morning only
+
+    # (label, skip_expiry, tue_windows)
+    variants = [
+        ("Skip Tuesday entirely   (current live)",  True,  None),
+        ("Tue: morning 9:30-11:00 only",            False, MORN_ONLY_WIN),
+        ("Tue: full window 9:30-13:00",             False, None),
+    ]
+
+    all_trades = {}
+    for label, skip_tue, tue_win in variants:
+        all_trades[label] = run_backtest(df5, days=DAYS, mode="ATM", ce_only=True,
+                                         candle_sl=True, target_pts=25,
+                                         entry_windows=LIVE_WIN,
+                                         skip_expiry=skip_tue,
+                                         tue_windows=tue_win)
+
+    sep = "="*84
     print(f"\n{sep}")
-    print(f"  SL STYLE & TARGET COMPARISON — {DAYS} days")
-    print(f"  Candle SL = prev candle low/high ± {CANDLE_SL_BUFFER}pt (dynamic)")
+    print(f"  TUESDAY TEST — {DAYS} days  |  CE-only  |  Candle SL + 25pt")
+    print(f"  Non-Tuesday window: 9:30-13:00 (fixed)  |  Tuesday window varied")
+    print(f"  ⚠️  Backtest uses delta model — real expiry premiums decay faster (theta)")
     print(sep)
-    print(f"  {'Variant':<40} {'Trades':>6} {'Win%':>6} {'SLs':>4} {'AvgSL':>7} {'Net P&L':>10} {'Monthly':>10}")
-    print(f"  {'-'*87}")
+    print(f"  {'Variant':<44} {'Trades':>6} {'Win%':>6} {'SLs':>4} {'BEs':>4} {'Net P&L':>10} {'Monthly':>9}")
+    print(f"  {'-'*86}")
 
-    best_net = max(qv(t)[3] for t in all_trades.values())
-    for label, csl, tgt, ceo in variants:
-        t, wr, sl, net, mon, asl = qv(all_trades[label])
+    best_net = max(qv(t)[4] for t in all_trades.values())
+    for label, skip_tue, tue_win in variants:
+        t, wr, sl, be, net, mon, _ = qv(all_trades[label])
         star = " ★" if net == best_net else ""
-        print(f"  {label:<40} {t:>6} {wr:>5.1f}% {sl:>4} {asl:>6.1f}pt {net:>10,.0f} {mon:>10,.0f}{star}")
-
+        print(f"  {label:<44} {t:>6} {wr:>5.1f}% {sl:>4} {be:>4} {net:>10,.0f} {mon:>9,.0f}{star}")
     print(sep)
 
-    # ── Full detailed report for confirmed winner (CE-only candle SL 25pt) ──
-    winner_label = "Candle SL + 25pt target"
-    print(f"\n  ★ CONFIRMED WINNER: {winner_label}")
-    print(f"{'='*70}")
-    print_report(all_trades[winner_label], days=DAYS, mode="ATM", ce_only=True,
-                 candle_sl=True, target_pts=25)
+    # ── Isolate Tuesday-only trades for each variant ──
+    def get_tuesday_trades(trades_list):
+        if not trades_list: return pd.DataFrame()
+        tdf = pd.DataFrame(trades_list)
+        return tdf[tdf['date'].apply(lambda d: pd.Timestamp(d).weekday() == EXPIRY_WEEKDAY)]
 
-    # ── PE breakdown for CE+PE variant ──
-    cepe_label = "Candle SL + 25pt  CE+PE both"
-    cepe_trades = all_trades[cepe_label]
-    if cepe_trades:
-        tdf_cepe = pd.DataFrame(cepe_trades)
-        bdf = tdf_cepe[tdf_cepe['signal']=='BUY']
-        sdf = tdf_cepe[tdf_cepe['signal']=='SELL']
-        bwr = len(bdf[bdf['outcome'].isin(['TARGET','TRAIL'])])/len(bdf)*100 if len(bdf) else 0
-        swr = len(sdf[sdf['outcome'].isin(['TARGET','TRAIL'])])/len(sdf)*100 if len(sdf) else 0
+    base_trades = pd.DataFrame(all_trades[variants[0][0]]) if all_trades[variants[0][0]] else pd.DataFrame()
+
+    for label, skip_tue, tue_win in variants[1:]:
+        tue_df = get_tuesday_trades(all_trades[label])
+        if len(tue_df) == 0:
+            print(f"\n  No Tuesday trades for: {label}")
+            continue
+        t_wins = len(tue_df[tue_df['outcome'].isin(['TARGET','TRAIL'])])
+        t_sls  = len(tue_df[tue_df['outcome']=='SL'])
+        t_bes  = len(tue_df[tue_df['outcome']=='BE'])
+        t_wr   = t_wins/len(tue_df)*100
+        t_net  = tue_df['pnl_rs'].sum()
         print(f"\n{sep}")
-        print(f"  CE+PE BREAKDOWN (Candle SL + 25pt target)")
+        print(f"  TUESDAY-ONLY — {label}")
         print(sep)
-        print(f"  CE (BUY) : {len(bdf)} trades | Win: {bwr:.1f}% | P&L: ₹{bdf['pnl_rs'].sum():,.0f}")
-        print(f"  PE (SELL): {len(sdf)} trades | Win: {swr:.1f}% | P&L: ₹{sdf['pnl_rs'].sum():,.0f}")
-        print(f"  Combined : {len(tdf_cepe)} trades | Win: {qv(cepe_trades)[1]:.1f}% | P&L: ₹{qv(cepe_trades)[3]:,.0f}")
+        print(f"  {len(tue_df)} trades | Win: {t_wr:.1f}% | SLs: {t_sls} | BEs: {t_bes} | P&L: ₹{t_net:,.0f}")
+        print(f"\n  {'Date':<12}{'Time':<7}{'Entry':<10}{'RSI':<6}{'Exit':<10}{'MaxFav':<9}{'P&L₹':<9}Result")
+        print(f"  {'-'*64}")
+        icons = {'TARGET':'✅','TRAIL':'🔒','SL':'❌','BE':'⚖️','WEAK':'⚠️','EOD':'➡️'}
+        for _, r in tue_df.iterrows():
+            icon = icons.get(r['outcome'], '➡️')
+            print(f"  {r['date']:<12}{r['time']:<7}{r['entry']:<10.2f}{r['rsi']:<6.1f}{r['exit']:<10.2f}"
+                  f"+{r['max_fav']:<8.1f}{r['pnl_rs']:<9.0f}{icon}{r['outcome']}")
         print(sep)
 
     # ── Final verdict ──
-    base_net  = qv(all_trades[variants[0][0]])[3]
-    base_wr   = qv(all_trades[variants[0][0]])[1]
-    win_net   = qv(all_trades[winner_label])[3]
-    win_wr    = qv(all_trades[winner_label])[1]
-    cepe_net  = qv(cepe_trades)[3]
-    cepe_wr   = qv(cepe_trades)[1]
+    s_t,  s_wr,  s_sl,  s_be,  s_net,  _, _ = qv(all_trades[variants[0][0]])
+    m_t,  m_wr,  m_sl,  m_be,  m_net,  _, _ = qv(all_trades[variants[1][0]])
+    f_t,  f_wr,  f_sl,  f_be,  f_net,  _, _ = qv(all_trades[variants[2][0]])
+
+    tue_morn = get_tuesday_trades(all_trades[variants[1][0]])
+    tue_full = get_tuesday_trades(all_trades[variants[2][0]])
+    tm_wr = len(tue_morn[tue_morn['outcome'].isin(['TARGET','TRAIL'])])/len(tue_morn)*100 if len(tue_morn) else 0
+    tf_wr = len(tue_full[tue_full['outcome'].isin(['TARGET','TRAIL'])])/len(tue_full)*100 if len(tue_full) else 0
 
     print(f"\n{sep}")
     print(f"  FINAL VERDICT")
     print(sep)
-    print(f"  Current live  : {base_wr:.1f}% win rate | ₹{base_net:,.0f} / 60 days")
-    print(f"  Candle SL 25pt (CE-only): {win_wr:.1f}% win rate | ₹{win_net:,.0f} / 60 days  (+{(win_net-base_net)/abs(base_net)*100:.0f}%)")
-    print(f"  Candle SL 25pt (CE+PE)  : {cepe_wr:.1f}% win rate | ₹{cepe_net:,.0f} / 60 days")
+    print(f"  Skip Tuesday (live)          : {s_wr:.1f}% win | {s_sl} SL | ₹{s_net:,.0f} / {DAYS}d")
+    print(f"  Tue morning 9:30-11:00 only  : {m_wr:.1f}% win | {m_sl} SL | ₹{m_net:,.0f} / {DAYS}d  [Tue: {tm_wr:.0f}% win]")
+    print(f"  Tue full 9:30-13:00          : {f_wr:.1f}% win | {f_sl} SL | ₹{f_net:,.0f} / {DAYS}d  [Tue: {tf_wr:.0f}% win]")
 
-    if cepe_net > win_net and cepe_wr >= win_wr:
-        print(f"\n  ✅ SWITCH TO CE+PE — adding PE makes it BETTER")
-        print(f"     Extra vs CE-only: ₹{cepe_net-win_net:,.0f}  |  Win rate: {cepe_wr:.1f}%")
+    best = max([(s_net,"Skip Tuesday (current live)"),
+                (m_net,"Tuesday morning 9:30-11:00 only"),
+                (f_net,"Tuesday full 9:30-13:00")], key=lambda x: x[0])
+    print(f"\n  ★ Best P&L: {best[1]} — ₹{best[0]:,.0f}")
+    if best[1] == "Skip Tuesday (current live)":
+        print(f"  ✅ Keep skipping Tuesday — no Tuesday window improves results")
+    elif tm_wr >= 70 and m_sl <= s_sl:
+        print(f"  ✅ Tuesday morning only is worth it — {tm_wr:.0f}% win, zero extra SL")
     else:
-        print(f"\n  ✅ KEEP CE-ONLY — PE does NOT help morning window")
-        print(f"     Stick with: Candle SL (prev low-{CANDLE_SL_BUFFER}pt) + 25pt target, CE-only")
+        print(f"  ❌ Tuesday still hurts even with narrower window — keep skipping")
+    print(f"\n  ⚠️  Real expiry premium decays faster than delta model assumes.")
     print(sep)
 
 if __name__ == "__main__":

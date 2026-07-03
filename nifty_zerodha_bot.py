@@ -277,6 +277,11 @@ def run_remote_backtest(days):
 
         df5 = bt.fetch_data(bt.NIFTY_TOKEN, "5minute", days=days)
         if df5 is None or df5.empty:
+            print("  Backtest fetch failed — re-logging in and retrying...")
+            if login():
+                bt.kite.set_access_token(kite.access_token)
+                df5 = bt.fetch_data(bt.NIFTY_TOKEN, "5minute", days=days)
+        if df5 is None or df5.empty:
             send_telegram("❌ Backtest failed — could not fetch price data.")
             return
         df15 = bt.fetch_data(bt.NIFTY_TOKEN, "15minute", days=days)
@@ -380,6 +385,22 @@ def process_telegram_commands():
                 exit_position("MANUAL")
             else:
                 send_telegram("No open position to square off.")
+        elif text == "/restart":
+            send_telegram("🔄 <b>RESTART requested</b> — forcing fresh Kite login...")
+            try:
+                import os
+                if os.path.exists(TOKEN_FILE):
+                    os.remove(TOKEN_FILE)
+            except Exception: pass
+            if auto_login():
+                send_telegram("✅ <b>Re-login successful</b> — new token active. Bot is running normally.")
+            else:
+                send_telegram(
+                    "❌ <b>Auto re-login FAILED</b>\n\n"
+                    "Check KITE_USER_ID / KITE_PASSWORD / KITE_TOTP_SECRET in .env on server.\n"
+                    "SSH in and run: sudo systemctl restart nifty-bot.service"
+                )
+
         elif text == "/backtest" or text.startswith("/backtest "):
             if backtest_running:
                 send_telegram("⏳ A backtest is already running — please wait for it to finish.")
@@ -402,6 +423,7 @@ def process_telegram_commands():
                 "/status — check armed state & position\n"
                 "/square_off — emergency close open position\n"
                 "/backtest [days] — run backtest, e.g. /backtest 60 (default 60, max 100)\n"
+                "/restart — force fresh Kite login (fixes token errors)\n"
                 "/help — this message"
             )
 
@@ -841,10 +863,17 @@ def check_signals(df5, df15, fut_vol):
         trend15 = e9 > e20
 
     df5 = df5.dropna(subset=['VWAP','AvgVol'])
-    if len(df5) < 2:
+    if len(df5) < 3:
         return None, None, {}, {}, None, None, None
 
-    curr = df5.iloc[-1]; prev = df5.iloc[-2]
+    # Always use COMPLETED candles only — skip the in-progress candle
+    last_ts = df5.index[-1]
+    if hasattr(last_ts, 'tzinfo') and last_ts.tzinfo is not None:
+        last_ts = last_ts.replace(tzinfo=None)
+    if (datetime.now() - last_ts).total_seconds() < 300:
+        curr = df5.iloc[-2]; prev = df5.iloc[-3]
+    else:
+        curr = df5.iloc[-1]; prev = df5.iloc[-2]
     price = float(curr['Close'])
     o,h,l,c = float(curr['Open']),float(curr['High']),float(curr['Low']),float(curr['Close'])
     vwap  = float(curr['VWAP'])

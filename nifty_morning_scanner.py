@@ -46,7 +46,7 @@ NIFTY_TOKEN = 256265
 BREAKEVEN_PCT  = 0.00034   # breakeven activation threshold (fixed %)
 STRIKE_GAP     = 50
 
-# Candle-structure SL + fixed target (backtest winner: 90.5% win, 0 SL in 60d)
+# Candle-structure SL + fixed target (backtest winner: 92.3% win, 0 SL in 60d)
 CANDLE_SL_BUFFER = 5    # spot pts below prev candle low
 TARGET_PTS       = 25   # fixed spot pts target
 
@@ -389,7 +389,7 @@ def process_telegram_commands():
                 f"Auto-trade: {armed_state}\n"
                 f"Window: {MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')}\n"
                 f"Strategy: CE (BUY) only | 4 conditions | ATM\n"
-                f"Backtest: 90.5% win rate, 0 SL/60d{pos_info}"
+                f"Backtest: 92.3% win rate, 0 SL/60d{pos_info}"
             )
         elif text == "/square_off":
             if position:
@@ -406,7 +406,7 @@ def process_telegram_commands():
                 f"🌅 Window: {MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')}\n"
                 "Strategy: <b>CE (BUY) only — ATM, 4 conditions</b>\n"
                 "  VWAP + Supertrend + Breakout + Clean candle\n\n"
-                "Backtest (60d): 90.5% win rate, 0 SL\n"
+                "Backtest (60d): 92.3% win rate, 0 SL\n"
                 "Send /start_auto to arm | /stop_auto to disarm"
             )
         elif text == "/morning_help":
@@ -845,7 +845,7 @@ def exit_position(reason):
     save_position_state()
 
 # ─── SIGNAL ENGINE — CE-only ATM, 4 conditions ───
-# Backtest winner (60 days): 21 trades, 90.5% win rate, 0 SL, Rs9,639 net
+# Backtest winner (60 days): 26 trades, 92.3% win rate, 0 SL, Rs12,020 net
 # SL: prev candle low - 5pt (dynamic). Target: 25pt fixed.
 # PE in morning = 41% win rate → CE-only confirmed as best.
 def check_signals_relaxed(df5):
@@ -986,7 +986,7 @@ def run_scanner():
     print(f"  Window: {MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')}")
     print("  4 conditions: VWAP + Supertrend + Breakout + Clean candle")
     print(f"  SL: prev candle low - {CANDLE_SL_BUFFER}pt (dynamic) | Target: {TARGET_PTS}pt fixed")
-    print("  CE (BUY) only — 90.5% win rate, 0 SL (60d backtest)")
+    print("  CE (BUY) only — 92.3% win rate, 0 SL (60d backtest)")
     print("  Auto-trade: DISARMED (send /start_auto to arm)")
     print("="*65)
 
