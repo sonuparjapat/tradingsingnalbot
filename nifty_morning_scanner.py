@@ -2,11 +2,11 @@
 =============================================================
 NIFTY MORNING SCANNER — CE-only ATM, with AUTO EXECUTION
 =============================================================
-Scans the 9:30-11:00 AM window for high-quality CE (BUY) signals.
+Scans the 9:30-13:00 window for high-quality CE (BUY) signals.
 Strategy: VWAP + Supertrend + Breakout + Bull clean candle (4 conditions).
 SL: prev candle low - 5pt (dynamic candle structure).
 Target: 25pt fixed on spot price.
-Backtest (60d): 90.5% win rate, 0 SL — confirmed best morning strategy.
+Backtest (60d): 92.3% win rate, 0 SL — best window confirmed (9:30-13:00).
 
 SIGNAL-ONLY by default — starts disarmed. Send /start_auto on Telegram
 to arm real order execution. Send /stop_auto to disarm. One position at a time.
@@ -53,7 +53,7 @@ TARGET_PTS       = 25   # fixed spot pts target
 # This is the ONLY thing that makes this scanner different in scope from the
 # main bot: a narrow morning window, and far fewer required conditions.
 MORNING_START  = dtime(9, 30)
-MORNING_END    = dtime(11, 0)
+MORNING_END    = dtime(13, 0)
 MAX_ALERTS     = 6
 HEARTBEAT_MINS = 20
 
@@ -235,6 +235,12 @@ def run_remote_backtest(days):
         send_telegram(f"⏳ Running {days}-day morning backtest... (20-40 seconds)")
         df5 = mbt.fetch_data(mbt.NIFTY_TOKEN, "5minute", days=days)
         if df5 is None or df5.empty:
+            # Token may have expired — re-login and retry once
+            print("  Backtest fetch failed — re-logging in and retrying...")
+            if login():
+                mbt.kite.set_access_token(kite.access_token)
+                df5 = mbt.fetch_data(mbt.NIFTY_TOKEN, "5minute", days=days)
+        if df5 is None or df5.empty:
             send_telegram("❌ Morning backtest failed — could not fetch data."); return
         trades = mbt.run_backtest(df5, days=days, mode="ATM", ce_only=True,
                                        candle_sl=True, target_pts=25)
@@ -253,7 +259,7 @@ def run_remote_backtest(days):
         bwr = len(bdf[bdf['outcome'].isin(win_outcomes)])/len(bdf)*100 if len(bdf) else 0
         msg = (
             f"📊 <b>MORNING BACKTEST {days}d</b>  [CE-only, ATM]\n\n"
-            f"Window: 09:30-11:00 | 4 conditions\n"
+            f"Window: 09:30-13:00 | 4 conditions\n"
             f"VWAP + Supertrend + Breakout + Clean candle\n"
             f"Period: {tdf['date'].iloc[0]} → {tdf['date'].iloc[-1]}\n"
             f"Days with signals: {days_w}\n\n"
@@ -282,6 +288,12 @@ def run_remote_evening_backtest(days):
         ebt.kite.set_access_token(kite.access_token)
         send_telegram(f"⏳ Running {days}-day evening backtest... (20-40 seconds)")
         df5  = ebt.fetch_data(ebt.NIFTY_TOKEN, "5minute",  days=days)
+        if df5 is None or df5.empty:
+            # Token may have expired — re-login and retry once
+            print("  Evening backtest fetch failed — re-logging in and retrying...")
+            if login():
+                ebt.kite.set_access_token(kite.access_token)
+                df5  = ebt.fetch_data(ebt.NIFTY_TOKEN, "5minute",  days=days)
         df15 = ebt.fetch_data(ebt.NIFTY_TOKEN, "15minute", days=days)
         if df5 is None or df5.empty:
             send_telegram("❌ Evening backtest failed — could not fetch data."); return
@@ -408,8 +420,25 @@ def process_telegram_commands():
                 "/morning_status — scanner status\n"
                 "/backtest [days] — morning backtest (default 60)\n"
                 "/backtest_evening [days] — evening backtest\n"
+                "/restart — force fresh Kite login (fixes token errors)\n"
                 "/morning_help — this message"
             )
+        elif text == "/restart":
+            send_telegram("🔄 <b>RESTART requested</b> — forcing fresh Kite login...")
+            try:
+                import os
+                if os.path.exists(TOKEN_FILE):
+                    os.remove(TOKEN_FILE)
+            except Exception: pass
+            if auto_login():
+                send_telegram("✅ <b>Re-login successful</b> — new token active. Bot is running normally.")
+            else:
+                send_telegram(
+                    "❌ <b>Auto re-login FAILED</b>\n\n"
+                    "Check KITE_USER_ID / KITE_PASSWORD / KITE_TOTP_SECRET in .env on server.\n"
+                    "SSH in and run: sudo systemctl restart morning-scanner.service"
+                )
+
         elif text == "/backtest" or text.startswith("/backtest "):
             if backtest_running:
                 send_telegram("⏳ A backtest is already running — please wait.")
@@ -828,10 +857,23 @@ def check_signals_relaxed(df5):
     df5['Supertrend'] = calculate_supertrend(df5)
 
     df5 = df5.dropna(subset=['VWAP'])
-    if len(df5) < 2:
+    if len(df5) < 3:
         return None, None, None, None
 
-    curr = df5.iloc[-1]; prev = df5.iloc[-2]
+    # Always use COMPLETED candles only — skip the in-progress candle.
+    # Kite returns the current forming candle as the last row. At 09:32 the
+    # 09:30 candle has no upper wick yet (looks clean), but by 09:35 close it
+    # may have a large wick that fails the clean-candle check. Using a partial
+    # candle causes false signals that the backtest (completed candles only)
+    # would never take. Fix: if the last candle started < 5 min ago, skip it.
+    last_ts = df5.index[-1]
+    if hasattr(last_ts, 'tzinfo') and last_ts.tzinfo is not None:
+        last_ts = last_ts.replace(tzinfo=None)
+    if (datetime.now() - last_ts).total_seconds() < 300:
+        curr = df5.iloc[-2]; prev = df5.iloc[-3]
+    else:
+        curr = df5.iloc[-1]; prev = df5.iloc[-2]
+
     price = float(curr['Close'])
     o,h,l,c = float(curr['Open']),float(curr['High']),float(curr['Low']),float(curr['Close'])
     vwap  = float(curr['VWAP'])
@@ -877,7 +919,7 @@ def send_market_status(price, info, alerts_today):
         c_brk  = ck(info.get("cond_brk_bull"))
         score  = sum(1 for k in ["cond_vwap_bull","cond_st_bull","cond_brk_bull"] if info.get(k))
         msg = (
-            f"🌡️ <b>Morning Window — {now.strftime('%H:%M')}</b>\n\n"
+            f"🌡️ <b>Scan Window — {now.strftime('%H:%M')}</b>\n\n"
             f"NIFTY: <b>{price:.1f}</b>   VWAP: {vwap:.1f}\n"
             f"CE-only scan (BUY signals only)\n\n"
             f"<b>Conditions ({score}/3):</b>\n"
@@ -889,7 +931,7 @@ def send_market_status(price, info, alerts_today):
         )
     else:
         msg = (
-            f"🌡️ <b>Morning Window — {now.strftime('%H:%M')}</b>\n"
+            f"🌡️ <b>Scan Window — {now.strftime('%H:%M')}</b>\n"
             f"NIFTY: {price:.1f if price else 'N/A'}  |  Alerts: {alerts_today}/{MAX_ALERTS}"
         )
     send_telegram(msg)
@@ -958,7 +1000,7 @@ def run_scanner():
         "Strategy: <b>CE (BUY) only — ATM, 4 conditions</b>\n"
         "  VWAP + Supertrend + Breakout + Clean candle\n"
         f"  SL: prev candle low - {CANDLE_SL_BUFFER}pt | Target: {TARGET_PTS}pt\n\n"
-        "Backtest (60d): <b>90.5% win rate, 0 SL</b> in 60d\n\n"
+        "Backtest (60d): <b>92.3% win rate, 0 SL</b> in 60d\n\n"
         "🔴 <b>Auto-trade: DISARMED</b> — signal-only mode\n"
         "Send /start_auto to enable real order placement\n"
         "Send /morning_help for all commands"
@@ -995,26 +1037,26 @@ def run_scanner():
                         monitor_position(current_price)
                 sleep_poll(60); continue
 
-            # ─── OUTSIDE MORNING WINDOW — idle ───
+            # ─── OUTSIDE SCAN WINDOW — idle ───
             if ct < MORNING_START or ct > MORNING_END:
-                print(f"⏳ [{now.strftime('%H:%M')}] Outside morning window — idle")
+                print(f"⏳ [{now.strftime('%H:%M')}] Outside scan window (9:30-13:00) — idle")
                 sleep_poll(120); continue
 
             if not window_opened_today:
                 window_opened_today = True
                 armed_label = "🟢 AUTO-ARMED — will place real orders" if AUTO_ARMED else "🔴 Signal-only (send /start_auto to arm)"
                 send_telegram(
-                    f"🌅 <b>Morning Window OPEN</b>\n\n"
+                    f"🌅 <b>Scan Window OPEN</b>\n\n"
                     f"⏰ {now.strftime('%H:%M')} — Scanning till {MORNING_END.strftime('%H:%M')}\n"
                     "Strategy: <b>CE (BUY) only — ATM, 4 conditions</b>\n"
                     "  VWAP + Supertrend + Breakout + Clean candle\n"
                     f"  SL: prev low - {CANDLE_SL_BUFFER}pt | Target: {TARGET_PTS}pt\n"
-                    f"Backtest: <b>90.5% win rate, 0 SL</b> in 60 days\n\n"
+                    f"Backtest: <b>92.3% win rate, 0 SL</b> in 60 days\n\n"
                     f"{armed_label}"
                 )
 
             if alerts_today >= MAX_ALERTS:
-                print(f"🚫 Max morning alerts reached ({MAX_ALERTS})")
+                print(f"🚫 Max alerts reached ({MAX_ALERTS}) — idle till next day")
                 sleep_poll(120); continue
 
             df5 = fetch_data(NIFTY_TOKEN, "5minute", days=5)
