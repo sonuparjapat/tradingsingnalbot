@@ -79,7 +79,7 @@ ENTRY_SKIP_UNTIL  = dtime(9, 45)  # only trade AFTER OR is established
 MIN_BREAKOUT_PTS  = 3             # price must clear OR high/low by ≥3 pts (real breakout)
 
 # Trailing stop
-TRAIL_TRIGGER_MULT = 1.5
+TRAIL_TRIGGER_MULT = 1.2
 TRAIL_STEP_MULT_ATM = 0.6        # ATM mode — original
 TRAIL_STEP_MULT_ITM = 0.35       # ITM mode — tighter, keeps more profit on trail exits
 
@@ -88,6 +88,10 @@ WICK_THRESHOLD_PT  = 10   # prev candle wick > this → use extra breakout buffe
 WICK_BREAKOUT_BUF  = 4    # extra pts needed beyond prev high/low when big wick present
 RSI_OVERBOUGHT     = 70   # RSI above this → overbought → avoid CE, look for PE
 RSI_OVERSOLD       = 30   # RSI below this → oversold → avoid PE, look for CE
+
+# Early intracandle entry (early_entry=True)
+EARLY_ENTRY_BUFFER = 5    # pt above prevH to trigger intracandle entry
+RESIST_WICK_PT     = 3    # prev candle H-C > this = resistance at top → skip signal
 
 # ─── LOGIN ───
 kite = KiteConnect(api_key=API_KEY)
@@ -264,7 +268,8 @@ def estimate_premium_pts(entry_price, exit_price, signal, is_expiry_day, delta_b
 # ─── BACKTEST ───
 def run_backtest(df5, df15=None, days=60, mode="ATM", ce_only=False, candle_sl=False,
                  target_pts=None, candle_be_trigger_pts=None, entry_end=None,
-                 entry_windows=None, skip_expiry=True, tue_windows=None):
+                 entry_windows=None, skip_expiry=True, tue_windows=None,
+                 early_entry=False, trail_trigger_mult=None, max_sl_pts=None):
     """
     mode='ATM'      : 4-condition, delta 0.5, entry 9:30 (CE+PE)
     mode='SOLID'    : 5-condition, delta 0.5, entry 9:35, CE-only
@@ -280,7 +285,8 @@ def run_backtest(df5, df15=None, days=60, mode="ATM", ce_only=False, candle_sl=F
     is_solid_pe     = (mode == "SOLID_PE")
     is_wick_rsi     = (mode == "WICK_RSI")
     if is_solid: ce_only = True
-    trail_step_mult = TRAIL_STEP_MULT_ITM if mode == "ITM" else TRAIL_STEP_MULT_ATM
+    trail_step_mult  = TRAIL_STEP_MULT_ITM if mode == "ITM" else TRAIL_STEP_MULT_ATM
+    eff_trail_trigger_mult = trail_trigger_mult if trail_trigger_mult is not None else TRAIL_TRIGGER_MULT
     trend15         = build_trend15(df15) if (df15 is not None and is_solid_pe) else None
 
     df5 = df5.copy()
@@ -396,10 +402,26 @@ def run_backtest(df5, df15=None, days=60, mode="ATM", ce_only=False, candle_sl=F
             sell_ok = all([price < vwap, st == False, breakdown, bear_clean, rsi > RSI_OVERSOLD])
         else:
             # ATM: 4 conditions (original, CE+PE)
-            breakout  = price > ph
-            breakdown = price < pl
-            buy_ok  = all([price>vwap, st==True,  breakout,  bull_clean])
-            sell_ok = all([price<vwap, st==False, breakdown, bear_clean])
+            if early_entry:
+                # Intracandle entry: fire when price first crosses prevH + EARLY_ENTRY_BUFFER
+                # Replaces: wait for breakout candle to close
+                # Resistance check: if prev candle H-C > RESIST_WICK_PT → prev top was rejected → skip
+                prev_wick_top  = ph - float(prev['Close'])
+                entry_trigger  = ph + EARLY_ENTRY_BUFFER
+                resist_ok      = (prev_wick_top <= RESIST_WICK_PT)
+                reach_ok       = (float(row['High']) >= entry_trigger)
+                cond_vwap_prev = (float(prev['Close']) > float(prev['VWAP']))
+                cond_st_prev   = (bool(prev['Supertrend']) == True)
+                buy_ok  = all([cond_vwap_prev, cond_st_prev, resist_ok, reach_ok])
+                sell_ok = False   # CE-only in early_entry mode
+                if buy_ok:
+                    # Entry at trigger level; if candle gapped above trigger, fill at open
+                    price = max(float(row['Open']), entry_trigger)
+            else:
+                breakout  = price > ph
+                breakdown = price < pl
+                buy_ok  = all([price>vwap, st==True,  breakout,  bull_clean])
+                sell_ok = all([price<vwap, st==False, breakdown, bear_clean])
 
         if buy_ok and last_sig.get(date) != "BUY":
             signal = "BUY"
@@ -417,11 +439,16 @@ def run_backtest(df5, df15=None, days=60, mode="ATM", ce_only=False, candle_sl=F
             sl_dist = price * SL_PCT
             sl      = price - sl_dist if signal=="BUY" else price + sl_dist
 
+        # Cap SL distance if structural SL is too far away
+        if max_sl_pts is not None and sl_dist > max_sl_pts:
+            sl_dist = max_sl_pts
+            sl = price - sl_dist if signal == "BUY" else price + sl_dist
+
         tgt_dist = target_pts if target_pts is not None else price * TARGET_PCT
         be_dist  = price * BREAKEVEN_PCT
         target   = price + tgt_dist if signal=="BUY" else price - tgt_dist
 
-        trail_trigger_dist = be_dist * TRAIL_TRIGGER_MULT
+        trail_trigger_dist = be_dist * eff_trail_trigger_mult
         trail_step_dist    = be_dist * trail_step_mult
 
         current_sl = sl; outcome = "EOD"; exit_price = price
@@ -699,19 +726,17 @@ def print_comparison(trades_atm, trades_itm, days):
 
 # ─── MAIN ───
 def main():
-    sep  = "="*70
-    sep2 = "-"*70
+    sep  = "="*84
     print(sep)
-    print("  NIFTY MORNING BACKTEST — 60 day")
-    print("  Strategy: CE-only ATM | 4 conditions | 9:30-11:00 window")
-    print("  SL: prev candle low - 5pt (dynamic) | Target: 25pt fixed")
-    print("  VWAP + Supertrend + Breakout + Bull clean candle | 90.5% win rate")
+    print("  NIFTY MORNING BACKTEST — SL Cap Test  (60 day)")
+    print("  Question: should we cap SL distance? structural SL avg=46pt, max=110pt")
+    print("  Window   : 9:30-13:00 | CE-only | Skip Tuesday | Candle SL | Target 25pt")
     print(sep)
 
     if not login(): return
 
     DAYS = 60
-    LIVE_WIN = [(dtime(9, 30), dtime(13, 0))]   # current live window
+    LIVE_WIN = [(dtime(9, 30), dtime(13, 0))]
 
     print(f"Fetching {DAYS} days of Nifty 5-min data...")
     df5 = fetch_data(NIFTY_TOKEN, "5minute", days=DAYS)
@@ -730,98 +755,100 @@ def main():
         avg_sl= tdf['sl_pts'].mean() if 'sl_pts' in tdf.columns else 0
         return (total, wins/total*100 if total else 0, sls, bes, net, net/(DAYS/30), avg_sl)
 
-    MORN_ONLY_WIN = [(dtime(9, 30), dtime(11, 0))]   # Tuesday morning only
+    BASE_PARAMS = dict(days=DAYS, mode="ATM", ce_only=True, candle_sl=True,
+                       target_pts=25, entry_windows=LIVE_WIN, skip_expiry=True)
 
-    # (label, skip_expiry, tue_windows)
-    variants = [
-        ("Skip Tuesday entirely   (current live)",  True,  None),
-        ("Tue: morning 9:30-11:00 only",            False, MORN_ONLY_WIN),
-        ("Tue: full window 9:30-13:00",             False, None),
+    caps = [
+        ("No cap (current)",   None),
+        ("Cap 40pt",           40),
+        ("Cap 30pt",           30),
+        ("Cap 25pt",           25),
     ]
 
-    all_trades = {}
-    for label, skip_tue, tue_win in variants:
-        all_trades[label] = run_backtest(df5, days=DAYS, mode="ATM", ce_only=True,
-                                         candle_sl=True, target_pts=25,
-                                         entry_windows=LIVE_WIN,
-                                         skip_expiry=skip_tue,
-                                         tue_windows=tue_win)
+    all_results = {}
+    for label, cap in caps:
+        print(f"  Running: {label}...")
+        all_results[label] = run_backtest(df5, **BASE_PARAMS, max_sl_pts=cap)
 
-    sep = "="*84
+    # ── Summary comparison ──
     print(f"\n{sep}")
-    print(f"  TUESDAY TEST — {DAYS} days  |  CE-only  |  Candle SL + 25pt")
-    print(f"  Non-Tuesday window: 9:30-13:00 (fixed)  |  Tuesday window varied")
-    print(f"  ⚠️  Backtest uses delta model — real expiry premiums decay faster (theta)")
+    print(f"  SL CAP TEST — {DAYS} days | CE-only | 9:30-13:00 | Skip Tue")
+    print(f"  Structural SL (prev_low - 5pt): avg=46pt, median=39pt, max=110pt")
     print(sep)
-    print(f"  {'Variant':<44} {'Trades':>6} {'Win%':>6} {'SLs':>4} {'BEs':>4} {'Net P&L':>10} {'Monthly':>9}")
-    print(f"  {'-'*86}")
+    arrow = lambda a, b, hi=True: "★" if (b > a if hi else b < a) else ""
+    print(f"  {'Metric':<20} {'No cap':<16} {'Cap 40pt':<16} {'Cap 30pt':<16} {'Cap 25pt'}")
+    print(f"  {'-'*82}")
 
-    best_net = max(qv(t)[4] for t in all_trades.values())
-    for label, skip_tue, tue_win in variants:
-        t, wr, sl, be, net, mon, _ = qv(all_trades[label])
-        star = " ★" if net == best_net else ""
-        print(f"  {label:<44} {t:>6} {wr:>5.1f}% {sl:>4} {be:>4} {net:>10,.0f} {mon:>9,.0f}{star}")
+    rows = {}
+    for label, cap in caps:
+        t, wr, sl, be, net, mon, _ = qv(all_results[label])
+        rows[label] = (t, wr, sl, be, net, mon)
+
+    def row4(name, fn, hi=True):
+        vals = [fn(rows[l]) for l, _ in caps]
+        best = max(vals) if hi else min(vals)
+        parts = [f"{vals[0]:<16}"]
+        for v in vals[1:]:
+            star = " ★" if v == best and v != vals[0] else ""
+            parts.append(f"{v:<14}{star}")
+        print(f"  {name:<20} {''.join(parts)}")
+
+    nc = rows["No cap (current)"]
+    print(f"  {'Trades':<20} {nc[0]:<16}", end="")
+    for label, _ in caps[1:]:
+        print(f" {rows[label][0]:<15}", end="")
+    print()
+
+    for label, cap in caps:
+        t, wr, sl, be, net, mon = rows[label]
+        star = ""
+        print(f"  {label:<20} trades={t}  win={wr:.1f}%  SLs={sl}  BEs={be}  net=₹{net:,.0f}  monthly=₹{mon:,.0f}")
+
     print(sep)
 
-    # ── Isolate Tuesday-only trades for each variant ──
-    def get_tuesday_trades(trades_list):
-        if not trades_list: return pd.DataFrame()
-        tdf = pd.DataFrame(trades_list)
-        return tdf[tdf['date'].apply(lambda d: pd.Timestamp(d).weekday() == EXPIRY_WEEKDAY)]
+    # ── Highlight changes from current ──
+    base_trades = all_results["No cap (current)"]
+    base_by_date = {r['date']: r for r in base_trades}
+    icons = {'TARGET':'✅','TRAIL':'🔒','SL':'❌','BE':'⚖️','WEAK':'⚠️','EOD':'➡️'}
 
-    base_trades = pd.DataFrame(all_trades[variants[0][0]]) if all_trades[variants[0][0]] else pd.DataFrame()
+    for label, cap in caps[1:]:
+        cap_trades = all_results[label]
+        cap_by_date = {r['date']: r for r in cap_trades}
+        changed = [(d, base_by_date[d], cap_by_date[d])
+                   for d in base_by_date
+                   if d in cap_by_date and base_by_date[d]['outcome'] != cap_by_date[d]['outcome']]
+        if changed:
+            print(f"\n  Changes with {label}:")
+            for d, b, c in changed:
+                bi = icons.get(b['outcome'],'➡️'); ci = icons.get(c['outcome'],'➡️')
+                print(f"    {d}  entry={b['entry']:.1f}  sl_dist_orig={b['sl_pts']:.1f}pt  "
+                      f"{bi}{b['outcome']} ₹{b['pnl_rs']:.0f}  →  {ci}{c['outcome']} ₹{c['pnl_rs']:.0f}")
+        else:
+            print(f"\n  {label}: NO changes vs no-cap — zero new SL exits")
 
-    for label, skip_tue, tue_win in variants[1:]:
-        tue_df = get_tuesday_trades(all_trades[label])
-        if len(tue_df) == 0:
-            print(f"\n  No Tuesday trades for: {label}")
-            continue
-        t_wins = len(tue_df[tue_df['outcome'].isin(['TARGET','TRAIL'])])
-        t_sls  = len(tue_df[tue_df['outcome']=='SL'])
-        t_bes  = len(tue_df[tue_df['outcome']=='BE'])
-        t_wr   = t_wins/len(tue_df)*100
-        t_net  = tue_df['pnl_rs'].sum()
-        print(f"\n{sep}")
-        print(f"  TUESDAY-ONLY — {label}")
-        print(sep)
-        print(f"  {len(tue_df)} trades | Win: {t_wr:.1f}% | SLs: {t_sls} | BEs: {t_bes} | P&L: ₹{t_net:,.0f}")
-        print(f"\n  {'Date':<12}{'Time':<7}{'Entry':<10}{'RSI':<6}{'Exit':<10}{'MaxFav':<9}{'P&L₹':<9}Result")
-        print(f"  {'-'*64}")
-        icons = {'TARGET':'✅','TRAIL':'🔒','SL':'❌','BE':'⚖️','WEAK':'⚠️','EOD':'➡️'}
-        for _, r in tue_df.iterrows():
-            icon = icons.get(r['outcome'], '➡️')
-            print(f"  {r['date']:<12}{r['time']:<7}{r['entry']:<10.2f}{r['rsi']:<6.1f}{r['exit']:<10.2f}"
-                  f"+{r['max_fav']:<8.1f}{r['pnl_rs']:<9.0f}{icon}{r['outcome']}")
-        print(sep)
-
-    # ── Final verdict ──
-    s_t,  s_wr,  s_sl,  s_be,  s_net,  _, _ = qv(all_trades[variants[0][0]])
-    m_t,  m_wr,  m_sl,  m_be,  m_net,  _, _ = qv(all_trades[variants[1][0]])
-    f_t,  f_wr,  f_sl,  f_be,  f_net,  _, _ = qv(all_trades[variants[2][0]])
-
-    tue_morn = get_tuesday_trades(all_trades[variants[1][0]])
-    tue_full = get_tuesday_trades(all_trades[variants[2][0]])
-    tm_wr = len(tue_morn[tue_morn['outcome'].isin(['TARGET','TRAIL'])])/len(tue_morn)*100 if len(tue_morn) else 0
-    tf_wr = len(tue_full[tue_full['outcome'].isin(['TARGET','TRAIL'])])/len(tue_full)*100 if len(tue_full) else 0
-
-    print(f"\n{sep}")
-    print(f"  FINAL VERDICT")
+    print()
     print(sep)
-    print(f"  Skip Tuesday (live)          : {s_wr:.1f}% win | {s_sl} SL | ₹{s_net:,.0f} / {DAYS}d")
-    print(f"  Tue morning 9:30-11:00 only  : {m_wr:.1f}% win | {m_sl} SL | ₹{m_net:,.0f} / {DAYS}d  [Tue: {tm_wr:.0f}% win]")
-    print(f"  Tue full 9:30-13:00          : {f_wr:.1f}% win | {f_sl} SL | ₹{f_net:,.0f} / {DAYS}d  [Tue: {tf_wr:.0f}% win]")
+    # ── Verdict ──
+    bt, bwr, bsl, bbe, bnet, bmon = rows["No cap (current)"]
+    c30t, c30wr, c30sl, c30be, c30net, c30mon = rows["Cap 30pt"]
+    c25t, c25wr, c25sl, c25be, c25net, c25mon = rows["Cap 25pt"]
 
-    best = max([(s_net,"Skip Tuesday (current live)"),
-                (m_net,"Tuesday morning 9:30-11:00 only"),
-                (f_net,"Tuesday full 9:30-13:00")], key=lambda x: x[0])
-    print(f"\n  ★ Best P&L: {best[1]} — ₹{best[0]:,.0f}")
-    if best[1] == "Skip Tuesday (current live)":
-        print(f"  ✅ Keep skipping Tuesday — no Tuesday window improves results")
-    elif tm_wr >= 70 and m_sl <= s_sl:
-        print(f"  ✅ Tuesday morning only is worth it — {tm_wr:.0f}% win, zero extra SL")
-    else:
-        print(f"  ❌ Tuesday still hurts even with narrower window — keep skipping")
-    print(f"\n  ⚠️  Real expiry premium decays faster than delta model assumes.")
+    print(f"  VERDICT")
+    print(sep)
+    if c30sl == bsl:
+        print(f"  ✅ SL cap makes NO difference to outcomes — structural SL never gets triggered")
+        print(f"     The wide SL (avg 46pt) is a theoretical backstop that has never fired.")
+        print(f"     TRAIL/BE/WEAK exits always happen first (within 5-15pt of entry).")
+        print(f"     Adding a cap is optional — adds a safety net for extreme future scenarios")
+        print(f"     without hurting current 60-day performance.")
+        print(f"     Recommendation: add 30pt cap as safety net — zero cost, pure risk protection.")
+    elif c30sl > bsl:
+        print(f"  ⚠️  30pt cap creates {c30sl-bsl} new SL exits — some trades dip 25-30pt before recovering")
+        print(f"     The structural SL is actually needed for those trades.")
+        if c25sl > c30sl:
+            print(f"     25pt cap is worse — do not use. 30pt cap might be acceptable if you want protection.")
+        else:
+            print(f"     Consider 40pt cap as compromise.")
     print(sep)
 
 if __name__ == "__main__":

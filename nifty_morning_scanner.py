@@ -1,14 +1,14 @@
 """
 =============================================================
-NIFTY MORNING SCANNER — CE-only ATM, with AUTO EXECUTION
+NIFTY MORNING SCANNER â€” CE-only ATM, with AUTO EXECUTION
 =============================================================
 Scans the 9:30-13:00 window for high-quality CE (BUY) signals.
 Strategy: VWAP + Supertrend + Breakout + Bull clean candle (4 conditions).
 SL: prev candle low - 5pt (dynamic candle structure).
 Target: 25pt fixed on spot price.
-Backtest (60d): 92.3% win rate, 0 SL — best window confirmed (9:30-13:00).
+Backtest (60d): 96.2% win rate, 0 SL â€” best window confirmed (9:30-13:00).
 
-SIGNAL-ONLY by default — starts disarmed. Send /start_auto on Telegram
+SIGNAL-ONLY by default â€” starts disarmed. Send /start_auto on Telegram
 to arm real order execution. Send /stop_auto to disarm. One position at a time.
 GTT OCO set for SL+Target on every entry. Breakeven and trailing stop auto-managed.
 Position persists across restarts via morning_position_state.json.
@@ -28,10 +28,10 @@ warnings.filterwarnings('ignore')
 
 load_dotenv()
 
-# ─── CREDENTIALS (from .env) — same Kite account as main NIFTY bot ───
+# â”€â”€â”€ CREDENTIALS (from .env) â€” same Kite account as main NIFTY bot â”€â”€â”€
 API_KEY    = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
-# Separate bot token strongly recommended — see sensex_zerodha_bot.py for why
+# Separate bot token strongly recommended â€” see sensex_zerodha_bot.py for why
 # (Telegram's getUpdates offset is global per bot token, not per-process; with
 # 3 processes sharing one token, a command can be silently swallowed by the
 # wrong one). Falls back to BOT_TOKEN if unset.
@@ -41,12 +41,12 @@ KITE_USER_ID    = os.getenv("KITE_USER_ID")
 KITE_PASSWORD   = os.getenv("KITE_PASSWORD")
 KITE_TOTP_SECRET = os.getenv("KITE_TOTP_SECRET")
 
-# ─── CONFIG ───
+# â”€â”€â”€ CONFIG â”€â”€â”€
 NIFTY_TOKEN = 256265
 BREAKEVEN_PCT  = 0.00034   # breakeven activation threshold (fixed %)
 STRIKE_GAP     = 50
 
-# Candle-structure SL + fixed target (backtest winner: 92.3% win, 0 SL in 60d)
+# Candle-structure SL + fixed target (backtest winner: 96.2% win, 0 SL in 60d)
 CANDLE_SL_BUFFER = 5    # spot pts below prev candle low
 TARGET_PTS       = 25   # fixed spot pts target
 
@@ -57,20 +57,20 @@ MORNING_END    = dtime(13, 0)
 MAX_ALERTS     = 6
 HEARTBEAT_MINS = 20
 
-EXPIRY_WEEKDAY = 1  # Tuesday — no morning signals on expiry day
+EXPIRY_WEEKDAY = 1  # Tuesday â€” no morning signals on expiry day
 
 # Auto-execution parameters (same as main bot + backtest)
 LOT_SIZE     = int(os.getenv("LOT_SIZE", "75"))
-OPTION_DELTA = 0.5    # ATM delta approx — converts spot pts to premium pts
-MOMENTUM_MIN = 5      # weak-exit threshold: if <5 pts after 15 min → exit
+OPTION_DELTA = 0.5    # ATM delta approx â€” converts spot pts to premium pts
+MOMENTUM_MIN = 5      # weak-exit threshold: if <5 pts after 15 min â†’ exit
 HARD_EXIT    = dtime(15, 10)
 
-TRAIL_TRIGGER_MULT = 1.5
+TRAIL_TRIGGER_MULT = 1.2
 TRAIL_STEP_MULT    = 0.6
 
 POSITION_FILE = "morning_position_state.json"
 
-# ─── AUTO-TRADING STATE (in-memory — resets to OFF on every restart) ───
+# â”€â”€â”€ AUTO-TRADING STATE (in-memory â€” resets to OFF on every restart) â”€â”€â”€
 AUTO_ARMED = False
 position   = None   # dict of open position or None
 
@@ -78,7 +78,7 @@ telegram_offset   = 0
 backtest_running  = False
 last_heartbeat    = None
 
-# ─── KITE ───
+# â”€â”€â”€ KITE â”€â”€â”€
 kite = KiteConnect(api_key=API_KEY)
 TOKEN_FILE = "kite_token.json"  # shared with all NIFTY/SENSEX scripts
 
@@ -92,7 +92,7 @@ def load_cached_token():
             return False
         kite.set_access_token(data["access_token"])
         kite.profile()
-        print("✅ Reused cached token from earlier today — no login needed\n")
+        print("âœ… Reused cached token from earlier today â€” no login needed\n")
         return True
     except Exception as e:
         print(f"  Cached token invalid ({e}), logging in fresh...")
@@ -103,11 +103,11 @@ def save_cached_token(access_token):
         with open(TOKEN_FILE, "w") as f:
             json.dump({"access_token": access_token, "date": datetime.now().strftime("%Y-%m-%d")}, f)
     except Exception as e:
-        print(f"⚠️ Could not cache token: {e}")
+        print(f"âš ï¸ Could not cache token: {e}")
 
 def auto_login():
     try:
-        print("🔐 Auto-login with TOTP...")
+        print("ðŸ” Auto-login with TOTP...")
         sess = requests.Session()
         sess.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -124,7 +124,7 @@ def auto_login():
         })
         data = resp.json()
         if data.get("status") != "success":
-            print(f"❌ Login step 1 failed: {data.get('message','Unknown error')}")
+            print(f"âŒ Login step 1 failed: {data.get('message','Unknown error')}")
             return False
         request_id = data["data"]["request_id"]
 
@@ -135,7 +135,7 @@ def auto_login():
         })
         data = resp.json()
         if data.get("status") != "success":
-            print(f"❌ TOTP failed: {data.get('message','Unknown error')}")
+            print(f"âŒ TOTP failed: {data.get('message','Unknown error')}")
             return False
 
         time.sleep(1)
@@ -157,28 +157,28 @@ def auto_login():
         parsed = parse_qs(urlparse(redirect_url).query)
         request_token = parsed.get("request_token", [None])[0]
         if not request_token:
-            print(f"❌ No request_token in redirect. Last URL={redirect_url[:200]}")
+            print(f"âŒ No request_token in redirect. Last URL={redirect_url[:200]}")
             return False
 
         session_data = kite.generate_session(request_token, api_secret=API_SECRET)
         kite.set_access_token(session_data["access_token"])
         save_cached_token(session_data["access_token"])
-        print("✅ Auto-login successful!\n")
+        print("âœ… Auto-login successful!\n")
         return True
     except Exception as e:
-        print(f"❌ Auto-login failed: {e}")
+        print(f"âŒ Auto-login failed: {e}")
         return False
 
 def manual_login():
     if not sys.stdin.isatty():
-        msg = ("❌ Auto-login failed AND no interactive terminal available to paste a token.\n"
+        msg = ("âŒ Auto-login failed AND no interactive terminal available to paste a token.\n"
                "Fix KITE_USER_ID / KITE_PASSWORD / KITE_TOTP_SECRET in .env and restart.")
         print(msg)
-        try: send_telegram(f"🆘 <b>MORNING SCANNER COULD NOT LOG IN</b>\n\n{msg}")
+        try: send_telegram(f"ðŸ†˜ <b>MORNING SCANNER COULD NOT LOG IN</b>\n\n{msg}")
         except Exception: pass
         return False
     login_url = kite.login_url()
-    print(f"\n🌐 Opening Zerodha login...\nURL: {login_url}")
+    print(f"\nðŸŒ Opening Zerodha login...\nURL: {login_url}")
     webbrowser.open(login_url)
     print("\nCopy request_token from redirect URL")
     request_token = input("\nPaste request_token: ").strip()
@@ -186,9 +186,9 @@ def manual_login():
         data = kite.generate_session(request_token, api_secret=API_SECRET)
         kite.set_access_token(data["access_token"])
         save_cached_token(data["access_token"])
-        print("✅ Login successful!\n"); return True
+        print("âœ… Login successful!\n"); return True
     except Exception as e:
-        print(f"❌ Login failed: {e}"); return False
+        print(f"âŒ Login failed: {e}"); return False
 
 def login():
     if load_cached_token():
@@ -196,7 +196,7 @@ def login():
     if KITE_USER_ID and KITE_PASSWORD and KITE_TOTP_SECRET and \
        KITE_USER_ID != "YOUR_USER_ID":
         if auto_login(): return True
-        print("⚠️ Auto-login failed, trying manual...")
+        print("âš ï¸ Auto-login failed, trying manual...")
     return manual_login()
 
 def send_telegram(msg):
@@ -232,20 +232,22 @@ def run_remote_backtest(days):
     try:
         import nifty_morning_backtest as mbt
         mbt.kite.set_access_token(kite.access_token)
-        send_telegram(f"⏳ Running {days}-day morning backtest... (20-40 seconds)")
+        send_telegram(f"â³ Running {days}-day morning backtest... (20-40 seconds)")
         df5 = mbt.fetch_data(mbt.NIFTY_TOKEN, "5minute", days=days)
         if df5 is None or df5.empty:
-            # Token may have expired — re-login and retry once
-            print("  Backtest fetch failed — re-logging in and retrying...")
+            # Token may have expired â€” re-login and retry once
+            print("  Backtest fetch failed â€” re-logging in and retrying...")
             if login():
                 mbt.kite.set_access_token(kite.access_token)
                 df5 = mbt.fetch_data(mbt.NIFTY_TOKEN, "5minute", days=days)
         if df5 is None or df5.empty:
-            send_telegram("❌ Morning backtest failed — could not fetch data."); return
+            send_telegram("âŒ Morning backtest failed â€” could not fetch data."); return
         trades = mbt.run_backtest(df5, days=days, mode="ATM", ce_only=True,
-                                       candle_sl=True, target_pts=25)
+                                       candle_sl=True, target_pts=25,
+                                       entry_windows=[(mbt.dtime(9,30), mbt.dtime(13,0))],
+                                       skip_expiry=True)
         if not trades:
-            send_telegram(f"📊 Morning backtest ({days}d): No signals found."); return
+            send_telegram(f"ðŸ“Š Morning backtest ({days}d): No signals found."); return
         tdf = pd.DataFrame(trades)
         total = len(tdf); win_outcomes = ['TARGET','TRAIL']
         wins  = len(tdf[tdf['outcome'].isin(win_outcomes)])
@@ -254,29 +256,29 @@ def run_remote_backtest(days):
         weak  = len(tdf[tdf['outcome']=='WEAK'])
         wr    = wins/total*100; net = tdf['pnl_rs'].sum()
         days_w = len(set(tdf['date']))
-        verdict = "✅ PROFITABLE" if wr>=75 and net>0 else ("⚡ MARGINAL" if net>0 else "❌ Needs work")
+        verdict = "âœ… PROFITABLE" if wr>=75 and net>0 else ("âš¡ MARGINAL" if net>0 else "âŒ Needs work")
         bdf = tdf[tdf['signal']=='BUY']
         bwr = len(bdf[bdf['outcome'].isin(win_outcomes)])/len(bdf)*100 if len(bdf) else 0
         msg = (
-            f"📊 <b>MORNING BACKTEST {days}d</b>  [CE-only, ATM]\n\n"
+            f"ðŸ“Š <b>MORNING BACKTEST {days}d</b>  [CE-only, ATM]\n\n"
             f"Window: 09:30-13:00 | 4 conditions\n"
             f"VWAP + Supertrend + Breakout + Clean candle\n"
-            f"Period: {tdf['date'].iloc[0]} → {tdf['date'].iloc[-1]}\n"
+            f"Period: {tdf['date'].iloc[0]} â†’ {tdf['date'].iloc[-1]}\n"
             f"Days with signals: {days_w}\n\n"
             f"<b>Total Signals: {total}</b> (CE only)\n"
-            f"✅ Wins (Tgt+Trail): {wins} ({wr:.1f}%)\n"
-            f"❌ SL: {loss} | ⚖️ BE: {bes} | ⚠️ Weak: {weak}\n\n"
-            f"💰 <b>Net P&L: Rs{net:,.0f}</b>\n\n{verdict}"
+            f"âœ… Wins (Tgt+Trail): {wins} ({wr:.1f}%)\n"
+            f"âŒ SL: {loss} | âš–ï¸ BE: {bes} | âš ï¸ Weak: {weak}\n\n"
+            f"ðŸ’° <b>Net P&L: Rs{net:,.0f}</b>\n\n{verdict}"
         )
         send_telegram(msg)
         csv_path = f"morning_backtest_{days}d.csv"
         tdf.to_csv(csv_path, index=False)
         with open(csv_path, "rb") as f:
             requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
-                data={"chat_id": CHAT_ID, "caption": f"📁 Morning backtest {days}d ({total} signals)"},
+                data={"chat_id": CHAT_ID, "caption": f"ðŸ“ Morning backtest {days}d ({total} signals)"},
                 files={"document": f}, timeout=30)
     except Exception as e:
-        send_telegram(f"❌ Morning backtest error: {e}")
+        send_telegram(f"âŒ Morning backtest error: {e}")
     finally:
         backtest_running = False
 
@@ -286,20 +288,20 @@ def run_remote_evening_backtest(days):
     try:
         import nifty_evening_backtest as ebt
         ebt.kite.set_access_token(kite.access_token)
-        send_telegram(f"⏳ Running {days}-day evening backtest... (20-40 seconds)")
+        send_telegram(f"â³ Running {days}-day evening backtest... (20-40 seconds)")
         df5  = ebt.fetch_data(ebt.NIFTY_TOKEN, "5minute",  days=days)
         if df5 is None or df5.empty:
-            # Token may have expired — re-login and retry once
-            print("  Evening backtest fetch failed — re-logging in and retrying...")
+            # Token may have expired â€” re-login and retry once
+            print("  Evening backtest fetch failed â€” re-logging in and retrying...")
             if login():
                 ebt.kite.set_access_token(kite.access_token)
                 df5  = ebt.fetch_data(ebt.NIFTY_TOKEN, "5minute",  days=days)
         df15 = ebt.fetch_data(ebt.NIFTY_TOKEN, "15minute", days=days)
         if df5 is None or df5.empty:
-            send_telegram("❌ Evening backtest failed — could not fetch data."); return
+            send_telegram("âŒ Evening backtest failed â€” could not fetch data."); return
         trades = ebt.run_backtest(df5, df15, days=days)
         if not trades:
-            send_telegram(f"📊 Evening backtest ({days}d): No signals found."); return
+            send_telegram(f"ðŸ“Š Evening backtest ({days}d): No signals found."); return
         tdf = pd.DataFrame(trades)
         total = len(tdf); win_outcomes = ['TARGET', 'TRAIL']
         wins  = len(tdf[tdf['outcome'].isin(win_outcomes)])
@@ -310,28 +312,28 @@ def run_remote_evening_backtest(days):
         days_w = len(set(tdf['date']))
         sdf   = tdf[tdf['signal'] == 'SELL']
         swr   = len(sdf[sdf['outcome'].isin(win_outcomes)]) / len(sdf) * 100 if len(sdf) else 0
-        verdict = "✅ PROFITABLE" if wr >= 55 and net > 0 else ("⚡ MARGINAL" if net > 0 else "❌ Needs work")
+        verdict = "âœ… PROFITABLE" if wr >= 55 and net > 0 else ("âš¡ MARGINAL" if net > 0 else "âŒ Needs work")
         msg = (
-            f"📊 <b>EVENING BACKTEST {days}d</b> [TIGHT MODE]\n\n"
+            f"ðŸ“Š <b>EVENING BACKTEST {days}d</b> [TIGHT MODE]\n\n"
             f"Window: 13:00-14:30 | PE/SELL only\n"
             f"7 conditions: VWAP + ST + 5min EMA bearish + 15min bearish + Breakdown + Clean + RSI(38-52)\n"
-            f"Period: {tdf['date'].iloc[0]} → {tdf['date'].iloc[-1]}\n"
+            f"Period: {tdf['date'].iloc[0]} â†’ {tdf['date'].iloc[-1]}\n"
             f"Days with signals: {days_w}\n\n"
             f"<b>Total Signals: {total}</b>\n"
-            f"✅ Wins (Tgt+Trail): {wins} ({wr:.1f}%)\n"
-            f"❌ SL: {loss} | ⚖️ BE: {bes} | ⚠️ Weak: {weak}\n\n"
+            f"âœ… Wins (Tgt+Trail): {wins} ({wr:.1f}%)\n"
+            f"âŒ SL: {loss} | âš–ï¸ BE: {bes} | âš ï¸ Weak: {weak}\n\n"
             f"PE: {len(sdf)} trades, {swr:.0f}% win\n\n"
-            f"💰 <b>Net P&L: ₹{net:,.0f}</b>\n\n{verdict}"
+            f"ðŸ’° <b>Net P&L: â‚¹{net:,.0f}</b>\n\n{verdict}"
         )
         send_telegram(msg)
         csv_path = f"evening_backtest_{days}d.csv"
         tdf.to_csv(csv_path, index=False)
         with open(csv_path, "rb") as f:
             requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
-                data={"chat_id": CHAT_ID, "caption": f"📁 Evening backtest {days}d ({total} signals)"},
+                data={"chat_id": CHAT_ID, "caption": f"ðŸ“ Evening backtest {days}d ({total} signals)"},
                 files={"document": f}, timeout=30)
     except Exception as e:
-        send_telegram(f"❌ Evening backtest error: {e}")
+        send_telegram(f"âŒ Evening backtest error: {e}")
     finally:
         backtest_running = False
 
@@ -348,9 +350,9 @@ def process_telegram_commands():
 
         if text == "/start_auto":
             AUTO_ARMED = True
-            print("🟢 MORNING AUTO-TRADING ARMED via Telegram")
+            print("ðŸŸ¢ MORNING AUTO-TRADING ARMED via Telegram")
             send_telegram(
-                "✅ <b>MORNING AUTO-TRADING ARMED</b> 🟢\n\n"
+                "âœ… <b>MORNING AUTO-TRADING ARMED</b> ðŸŸ¢\n\n"
                 "Bot will now place REAL orders when a BUY CE signal fires.\n"
                 f"Strategy: VWAP + Supertrend + Breakout + Clean candle\n"
                 f"Lot size: {LOT_SIZE} | One position at a time.\n"
@@ -360,105 +362,105 @@ def process_telegram_commands():
             )
         elif text == "/stop_auto":
             AUTO_ARMED = False
-            print("🔴 MORNING AUTO-TRADING DISARMED via Telegram")
+            print("ðŸ”´ MORNING AUTO-TRADING DISARMED via Telegram")
             send_telegram(
-                "⛔ <b>MORNING AUTO-TRADING DISARMED</b>\n\n"
+                "â›” <b>MORNING AUTO-TRADING DISARMED</b>\n\n"
                 "No new orders will be placed. Existing position (if any) continues monitoring.\n"
                 "Send /square_off to close any open position manually."
             )
         elif text == "/status":
-            armed_state = "🟢 ARMED — placing real orders" if AUTO_ARMED else "🔴 DISARMED — signal-only"
+            armed_state = "ðŸŸ¢ ARMED â€” placing real orders" if AUTO_ARMED else "ðŸ”´ DISARMED â€” signal-only"
             if position:
                 entry_time_str = position["entry_time"].strftime("%H:%M") if isinstance(position["entry_time"], datetime) else str(position["entry_time"])
                 pos_info = (
-                    f"\n\n📦 <b>Open Position:</b>\n"
+                    f"\n\nðŸ“¦ <b>Open Position:</b>\n"
                     f"{position['signal']} {position['symbol']}\n"
                     f"Entry time: {entry_time_str}\n"
                     f"Entry premium: {position['entry_premium']}\n"
                     f"SL premium: {position['sl_premium']}\n"
                     f"Target premium: {position['target_premium']}\n"
-                    f"Breakeven: {'✅ Hit' if position['breakeven_hit'] else '⏳ Not yet'}\n"
-                    f"Trailing: {'🔒 Active' if position.get('trail_active') else 'Not yet'}\n"
+                    f"Breakeven: {'âœ… Hit' if position['breakeven_hit'] else 'â³ Not yet'}\n"
+                    f"Trailing: {'ðŸ”’ Active' if position.get('trail_active') else 'Not yet'}\n"
                     f"Peak spot move: +{position.get('peak_favorable', 0):.1f} pts\n\n"
                     f"To exit now: send /square_off"
                 )
             else:
                 pos_info = "\n\nNo open position."
             send_telegram(
-                f"📊 <b>Morning Scanner Status</b>\n\n"
+                f"ðŸ“Š <b>Morning Scanner Status</b>\n\n"
                 f"Auto-trade: {armed_state}\n"
                 f"Window: {MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')}\n"
                 f"Strategy: CE (BUY) only | 4 conditions | ATM\n"
-                f"Backtest: 92.3% win rate, 0 SL/60d{pos_info}"
+                f"Backtest: 96.2% win rate, 0 SL/60d{pos_info}"
             )
         elif text == "/square_off":
             if position:
-                send_telegram(f"🔴 Manual square-off requested for {position['symbol']}...")
+                send_telegram(f"ðŸ”´ Manual square-off requested for {position['symbol']}...")
                 exit_position("MANUAL")
             else:
-                send_telegram("ℹ️ No open morning position to square off.")
+                send_telegram("â„¹ï¸ No open morning position to square off.")
 
         elif text == "/morning_status":
-            armed_state = "🟢 ARMED" if AUTO_ARMED else "🔴 DISARMED (signal-only)"
+            armed_state = "ðŸŸ¢ ARMED" if AUTO_ARMED else "ðŸ”´ DISARMED (signal-only)"
             send_telegram(
-                "📊 <b>Morning Scanner Status</b>\n\n"
+                "ðŸ“Š <b>Morning Scanner Status</b>\n\n"
                 f"Auto-trade: {armed_state}\n"
-                f"🌅 Window: {MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')}\n"
-                "Strategy: <b>CE (BUY) only — ATM, 4 conditions</b>\n"
+                f"ðŸŒ… Window: {MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')}\n"
+                "Strategy: <b>CE (BUY) only â€” ATM, 4 conditions</b>\n"
                 "  VWAP + Supertrend + Breakout + Clean candle\n\n"
-                "Backtest (60d): 92.3% win rate, 0 SL\n"
+                "Backtest (60d): 96.2% win rate, 0 SL\n"
                 "Send /start_auto to arm | /stop_auto to disarm"
             )
         elif text == "/morning_help":
             send_telegram(
-                "🤖 <b>Morning Scanner Commands</b>\n\n"
+                "ðŸ¤– <b>Morning Scanner Commands</b>\n\n"
                 "CE-only ATM strategy | 4 conditions | 90.5% win rate (60d backtest)\n\n"
-                "/start_auto — arm real order execution\n"
-                "/stop_auto — disarm (no new entries)\n"
-                "/status — show armed state + open position\n"
-                "/square_off — emergency close open position\n"
-                "/morning_status — scanner status\n"
-                "/backtest [days] — morning backtest (default 60)\n"
-                "/backtest_evening [days] — evening backtest\n"
-                "/restart — force fresh Kite login (fixes token errors)\n"
-                "/morning_help — this message"
+                "/start_auto â€” arm real order execution\n"
+                "/stop_auto â€” disarm (no new entries)\n"
+                "/status â€” show armed state + open position\n"
+                "/square_off â€” emergency close open position\n"
+                "/morning_status â€” scanner status\n"
+                "/backtest [days] â€” morning backtest (default 60)\n"
+                "/backtest_evening [days] â€” evening backtest\n"
+                "/restart â€” force fresh Kite login (fixes token errors)\n"
+                "/morning_help â€” this message"
             )
         elif text == "/restart":
-            send_telegram("🔄 <b>RESTART requested</b> — forcing fresh Kite login...")
+            send_telegram("ðŸ”„ <b>RESTART requested</b> â€” forcing fresh Kite login...")
             try:
                 import os
                 if os.path.exists(TOKEN_FILE):
                     os.remove(TOKEN_FILE)
             except Exception: pass
             if auto_login():
-                send_telegram("✅ <b>Re-login successful</b> — new token active. Bot is running normally.")
+                send_telegram("âœ… <b>Re-login successful</b> â€” new token active. Bot is running normally.")
             else:
                 send_telegram(
-                    "❌ <b>Auto re-login FAILED</b>\n\n"
+                    "âŒ <b>Auto re-login FAILED</b>\n\n"
                     "Check KITE_USER_ID / KITE_PASSWORD / KITE_TOTP_SECRET in .env on server.\n"
                     "SSH in and run: sudo systemctl restart morning-scanner.service"
                 )
 
         elif text == "/backtest" or text.startswith("/backtest "):
             if backtest_running:
-                send_telegram("⏳ A backtest is already running — please wait.")
+                send_telegram("â³ A backtest is already running â€” please wait.")
             else:
                 parts = text.split(); days = 60
                 if len(parts) > 1:
                     try: days = max(5, min(100, int(parts[1])))
                     except ValueError:
-                        send_telegram("⚠️ Usage: /backtest 60  (5-100 days)"); continue
+                        send_telegram("âš ï¸ Usage: /backtest 60  (5-100 days)"); continue
                 backtest_running = True
                 threading.Thread(target=run_remote_backtest, args=(days,), daemon=True).start()
         elif text == "/backtest_evening" or text.startswith("/backtest_evening "):
             if backtest_running:
-                send_telegram("⏳ A backtest is already running — please wait.")
+                send_telegram("â³ A backtest is already running â€” please wait.")
             else:
                 parts = text.split(); days = 60
                 if len(parts) > 1:
                     try: days = max(5, min(100, int(parts[1])))
                     except ValueError:
-                        send_telegram("⚠️ Usage: /backtest_evening 60  (5-100 days)"); continue
+                        send_telegram("âš ï¸ Usage: /backtest_evening 60  (5-100 days)"); continue
                 backtest_running = True
                 threading.Thread(target=run_remote_evening_backtest, args=(days,), daemon=True).start()
 
@@ -470,7 +472,7 @@ def sleep_poll(seconds):
         elapsed += chunk
         process_telegram_commands()
 
-# ─── DATA ───
+# â”€â”€â”€ DATA â”€â”€â”€
 def fetch_data(token, interval="5minute", days=2):
     def _fetch():
         candles = kite.historical_data(token, datetime.now()-timedelta(days=days),
@@ -486,8 +488,8 @@ def fetch_data(token, interval="5minute", days=2):
     except Exception as e:
         err = str(e)
         if "access_token" in err or "api_key" in err or "Incorrect" in err:
-            print(f"  ⚠️ Auth error — re-logging in automatically...")
-            send_telegram("⚠️ <b>Morning Scanner: session expired</b> — re-logging in automatically...")
+            print(f"  âš ï¸ Auth error â€” re-logging in automatically...")
+            send_telegram("âš ï¸ <b>Morning Scanner: session expired</b> â€” re-logging in automatically...")
             if login():
                 try:
                     return _fetch()
@@ -495,7 +497,7 @@ def fetch_data(token, interval="5minute", days=2):
                     print(f"  Data error after relogin: {e2}"); return None
         print(f"  Data error: {e}"); return None
 
-# ─── INDICATORS (same as main bot) ───
+# â”€â”€â”€ INDICATORS (same as main bot) â”€â”€â”€
 def ema(s, p): return s.ewm(span=p, adjust=False).mean()
 
 def calculate_vwap(df):
@@ -536,12 +538,12 @@ def analyze_candle(o,h,l,c):
     return doji, (not doji and c>o and uw<=body), (not doji and c<o and lw<=body)
 
 def get_strike(price, signal):
-    """ATM strike — backtest confirmed ATM outperforms ITM in morning window"""
+    """ATM strike â€” backtest confirmed ATM outperforms ITM in morning window"""
     atm = round(price / STRIKE_GAP) * STRIKE_GAP
     if signal == "BUY": return f"{atm} CE"
     else: return f"{atm} PE"
 
-# ─── ORDER EXECUTION (only runs when AUTO_ARMED == True) ───
+# â”€â”€â”€ ORDER EXECUTION (only runs when AUTO_ARMED == True) â”€â”€â”€
 def find_option_symbol(price, signal):
     """Find ATM CE tradingsymbol for the nearest weekly expiry."""
     try:
@@ -558,7 +560,7 @@ def find_option_symbol(price, signal):
         if opts.empty: return None
         return opts.iloc[0]['tradingsymbol']
     except Exception as e:
-        print(f"❌ Symbol lookup error: {e}")
+        print(f"âŒ Symbol lookup error: {e}")
         return None
 
 def check_sufficient_funds(estimated_premium, qty):
@@ -570,7 +572,7 @@ def check_sufficient_funds(estimated_premium, qty):
         sufficient = available_cash >= (required + buffer)
         return sufficient, available_cash, required
     except Exception as e:
-        print(f"⚠️ Margin check failed: {e}")
+        print(f"âš ï¸ Margin check failed: {e}")
         return False, 0, 0
 
 def place_entry_order(symbol, qty):
@@ -582,8 +584,8 @@ def place_entry_order(symbol, qty):
         )
         return order_id
     except Exception as e:
-        print(f"❌ Entry order failed: {e}")
-        send_telegram(f"❌ <b>ENTRY ORDER FAILED</b>\n{symbol}\n{e}")
+        print(f"âŒ Entry order failed: {e}")
+        send_telegram(f"âŒ <b>ENTRY ORDER FAILED</b>\n{symbol}\n{e}")
         return None
 
 def get_order_avg_price(order_id, timeout=15):
@@ -596,7 +598,7 @@ def get_order_avg_price(order_id, timeout=15):
                 return float(last['average_price'])
             elif last['status'] in ('REJECTED', 'CANCELLED'):
                 print(f"  Order {order_id} {last['status']}: {last.get('status_message','')}")
-                send_telegram(f"❌ Entry order {last['status']}: {last.get('status_message','')}")
+                send_telegram(f"âŒ Entry order {last['status']}: {last.get('status_message','')}")
                 return None
         except Exception as e:
             print(f"  Order status check error: {e}")
@@ -612,8 +614,8 @@ def place_exit_order(symbol, qty):
         )
         return order_id
     except Exception as e:
-        print(f"❌ Exit order failed: {e}")
-        send_telegram(f"❌ <b>EXIT ORDER FAILED — CLOSE {symbol} MANUALLY NOW</b>\n{e}")
+        print(f"âŒ Exit order failed: {e}")
+        send_telegram(f"âŒ <b>EXIT ORDER FAILED â€” CLOSE {symbol} MANUALLY NOW</b>\n{e}")
         return None
 
 def place_gtt_oco(symbol, qty, sl_premium, target_premium, last_price):
@@ -630,8 +632,8 @@ def place_gtt_oco(symbol, qty, sl_premium, target_premium, last_price):
         )
         return gtt["trigger_id"]
     except Exception as e:
-        print(f"❌ GTT placement failed: {e}")
-        send_telegram(f"⚠️ <b>GTT FAILED — manage SL/Target manually for {symbol}!</b>\n{e}")
+        print(f"âŒ GTT placement failed: {e}")
+        send_telegram(f"âš ï¸ <b>GTT FAILED â€” manage SL/Target manually for {symbol}!</b>\n{e}")
         return None
 
 def modify_gtt_sl(gtt_id, symbol, qty, new_sl, target_premium, last_price):
@@ -649,7 +651,7 @@ def modify_gtt_sl(gtt_id, symbol, qty, new_sl, target_premium, last_price):
         )
         return True
     except Exception as e:
-        print(f"⚠️ GTT modify failed: {e}")
+        print(f"âš ï¸ GTT modify failed: {e}")
         return False
 
 def cancel_gtt(gtt_id):
@@ -657,7 +659,7 @@ def cancel_gtt(gtt_id):
         kite.delete_gtt(gtt_id)
         return True
     except Exception as e:
-        print(f"⚠️ GTT cancel failed: {e}")
+        print(f"âš ï¸ GTT cancel failed: {e}")
         return False
 
 def check_gtt_triggered():
@@ -670,12 +672,12 @@ def check_gtt_triggered():
         gtt_map = {g['id']: g for g in gtts}
         our_gtt = gtt_map.get(position["gtt_id"])
         if our_gtt is None:
-            return  # GTT not visible yet — don't clear (we cancel it ourselves on exit)
+            return  # GTT not visible yet â€” don't clear (we cancel it ourselves on exit)
         if our_gtt['status'] == 'triggered':
-            # Zerodha fired the GTT — SL or target was hit, position auto-closed
+            # Zerodha fired the GTT â€” SL or target was hit, position auto-closed
             send_telegram(
-                f"✅ <b>POSITION CLOSED (GTT triggered)</b>\n\n"
-                f"{position['symbol']}\nSL or Target hit — Zerodha closed the position.\n"
+                f"âœ… <b>POSITION CLOSED (GTT triggered)</b>\n\n"
+                f"{position['symbol']}\nSL or Target hit â€” Zerodha closed the position.\n"
                 f"Check Kite app for final P&L."
             )
             position = None
@@ -688,7 +690,7 @@ def save_position_state():
     if position is None:
         if os.path.exists(POSITION_FILE):
             try: os.remove(POSITION_FILE)
-            except Exception as e: print(f"⚠️ Could not remove position file: {e}")
+            except Exception as e: print(f"âš ï¸ Could not remove position file: {e}")
         return
     try:
         data = position.copy()
@@ -696,7 +698,7 @@ def save_position_state():
         with open(POSITION_FILE, "w") as f:
             json.dump(data, f)
     except Exception as e:
-        print(f"⚠️ Could not save position state: {e}")
+        print(f"âš ï¸ Could not save position state: {e}")
 
 def load_position_state():
     global position
@@ -707,44 +709,44 @@ def load_position_state():
             data = json.load(f)
         data["entry_time"] = datetime.fromisoformat(data["entry_time"])
         position = data
-        print(f"🔄 Recovered open position: {position['symbol']}")
+        print(f"ðŸ”„ Recovered open position: {position['symbol']}")
         send_telegram(
-            f"🔄 <b>MORNING POSITION RECOVERED AFTER RESTART</b>\n\n"
+            f"ðŸ”„ <b>MORNING POSITION RECOVERED AFTER RESTART</b>\n\n"
             f"{position['symbol']}\nEntry: {position['entry_premium']}\n"
             f"SL: {position['sl_premium']} | Target: {position['target_premium']}\n"
             f"Breakeven hit: {'Yes' if position['breakeven_hit'] else 'No'}\n\n"
             f"Resuming monitoring. GTT was untouched while bot was down."
         )
     except Exception as e:
-        print(f"⚠️ Could not load position state: {e}")
-        send_telegram(f"⚠️ <b>Found a saved morning position but couldn't load it!</b>\n{e}\n\nCheck Kite manually.")
+        print(f"âš ï¸ Could not load position state: {e}")
+        send_telegram(f"âš ï¸ <b>Found a saved morning position but couldn't load it!</b>\n{e}\n\nCheck Kite manually.")
 
 def execute_entry(signal, price, prev_low):
     """Place a real BUY CE order. Called only when AUTO_ARMED and position is None."""
     global position
     symbol = find_option_symbol(price, signal)
     if not symbol:
-        send_telegram(f"❌ Could not find ATM CE symbol — auto-entry skipped")
+        send_telegram(f"âŒ Could not find ATM CE symbol â€” auto-entry skipped")
         return
 
     try:
         quote = kite.quote([f"NFO:{symbol}"])
         ltp = quote[f"NFO:{symbol}"]["last_price"]
     except Exception as e:
-        send_telegram(f"❌ Could not fetch LTP for {symbol} — auto-entry skipped\n{e}")
+        send_telegram(f"âŒ Could not fetch LTP for {symbol} â€” auto-entry skipped\n{e}")
         return
 
     has_funds, available, required = check_sufficient_funds(ltp, LOT_SIZE)
     if not has_funds:
         send_telegram(
-            f"❌ <b>INSUFFICIENT FUNDS — TRADE SKIPPED</b>\n\n"
-            f"{symbol}\nRequired: ₹{required:,.0f} (+5% buffer)\n"
-            f"Available: ₹{available:,.0f}\n\n"
+            f"âŒ <b>INSUFFICIENT FUNDS â€” TRADE SKIPPED</b>\n\n"
+            f"{symbol}\nRequired: â‚¹{required:,.0f} (+5% buffer)\n"
+            f"Available: â‚¹{available:,.0f}\n\n"
             f"Add funds or reduce LOT_SIZE in .env"
         )
         return
 
-    send_telegram(f"🤖 <b>AUTO-EXECUTING MORNING ENTRY</b>\nBUY {symbol}\nQty: {LOT_SIZE} | LTP: {ltp}")
+    send_telegram(f"ðŸ¤– <b>AUTO-EXECUTING MORNING ENTRY</b>\nBUY {symbol}\nQty: {LOT_SIZE} | LTP: {ltp}")
 
     order_id = place_entry_order(symbol, LOT_SIZE)
     if not order_id:
@@ -752,7 +754,7 @@ def execute_entry(signal, price, prev_low):
 
     avg_price = get_order_avg_price(order_id)
     if avg_price is None:
-        send_telegram(f"⚠️ Order {order_id} for {symbol} not confirmed — CHECK KITE MANUALLY")
+        send_telegram(f"âš ï¸ Order {order_id} for {symbol} not confirmed â€” CHECK KITE MANUALLY")
         return
 
     # Candle-structure SL: few pts below previous candle low (dynamic)
@@ -773,9 +775,9 @@ def execute_entry(signal, price, prev_low):
     }
     save_position_state()
 
-    gtt_status = "Set ✅" if gtt_id else "FAILED ⚠️ manage manually!"
+    gtt_status = "Set âœ…" if gtt_id else "FAILED âš ï¸ manage manually!"
     send_telegram(
-        f"✅ <b>MORNING POSITION OPEN</b>\n\n"
+        f"âœ… <b>MORNING POSITION OPEN</b>\n\n"
         f"{symbol}\nEntry premium: {avg_price}\n"
         f"SL: {sl_premium} (prev low {prev_low:.1f} - {CANDLE_SL_BUFFER}pt = {sl_spot:.1f}, ~{sl_spot_dist:.1f}pt risk)\n"
         f"Target: {target_premium} (+{TARGET_PTS}pt spot = +{TARGET_PTS*OPTION_DELTA:.1f}pt premium)\n"
@@ -784,7 +786,7 @@ def execute_entry(signal, price, prev_low):
     )
 
 def monitor_position(current_spot):
-    """Breakeven, trailing stop, weak exit, hard exit — matches backtest logic exactly."""
+    """Breakeven, trailing stop, weak exit, hard exit â€” matches backtest logic exactly."""
     global position
     if position is None: return
 
@@ -801,7 +803,7 @@ def monitor_position(current_spot):
             if ok:
                 position["breakeven_hit"] = True
                 save_position_state()
-                send_telegram(f"⚖️ <b>BREAKEVEN ACTIVATED</b>\n{position['symbol']}\nSL moved to entry: {position['entry_premium']}")
+                send_telegram(f"âš–ï¸ <b>BREAKEVEN ACTIVATED</b>\n{position['symbol']}\nSL moved to entry: {position['entry_premium']}")
 
     trail_trigger_dist = be_threshold * TRAIL_TRIGGER_MULT
     trail_step_dist    = be_threshold * TRAIL_STEP_MULT
@@ -819,18 +821,18 @@ def monitor_position(current_spot):
                 position["breakeven_hit"] = True
                 position["trail_active"] = True
                 save_position_state()
-                send_telegram(f"🔒 <b>TRAILING STOP</b>\n{position['symbol']}\nSL moved to {new_sl_premium} (locking profit)")
+                send_telegram(f"ðŸ”’ <b>TRAILING STOP</b>\n{position['symbol']}\nSL moved to {new_sl_premium} (locking profit)")
 
     elapsed_min = (datetime.now() - position["entry_time"]).total_seconds() / 60
     if elapsed_min >= 15 and not position["weak_checked"]:
         position["weak_checked"] = True
         if spot_move < MOMENTUM_MIN:
-            send_telegram(f"⚠️ <b>WEAK MOMENTUM</b> — exiting {position['symbol']} (only {spot_move:.1f}pts after 15min)")
+            send_telegram(f"âš ï¸ <b>WEAK MOMENTUM</b> â€” exiting {position['symbol']} (only {spot_move:.1f}pts after 15min)")
             exit_position("WEAK")
             return
 
     if datetime.now().time() >= HARD_EXIT:
-        send_telegram(f"⏰ <b>HARD EXIT TIME (3:10 PM)</b> — closing {position['symbol']}")
+        send_telegram(f"â° <b>HARD EXIT TIME (3:10 PM)</b> â€” closing {position['symbol']}")
         exit_position("EOD")
 
 def exit_position(reason):
@@ -840,14 +842,14 @@ def exit_position(reason):
     if position["gtt_id"]:
         cancel_gtt(position["gtt_id"])
     order_id = place_exit_order(position["symbol"], position["qty"])
-    send_telegram(f"🔚 <b>POSITION CLOSED ({reason})</b>\n{position['symbol']}\nExit order: {order_id}")
+    send_telegram(f"ðŸ”š <b>POSITION CLOSED ({reason})</b>\n{position['symbol']}\nExit order: {order_id}")
     position = None
     save_position_state()
 
-# ─── SIGNAL ENGINE — CE-only ATM, 4 conditions ───
-# Backtest winner (60 days): 26 trades, 92.3% win rate, 0 SL, Rs12,020 net
+# â”€â”€â”€ SIGNAL ENGINE â€” CE-only ATM, 4 conditions â”€â”€â”€
+# Backtest winner (60 days): 26 trades, 96.2% win rate, 0 SL, Rs11,298 net
 # SL: prev candle low - 5pt (dynamic). Target: 25pt fixed.
-# PE in morning = 41% win rate → CE-only confirmed as best.
+# PE in morning = 41% win rate â†’ CE-only confirmed as best.
 def check_signals_relaxed(df5):
     if len(df5) < 30:
         return None, None, None, None
@@ -860,7 +862,7 @@ def check_signals_relaxed(df5):
     if len(df5) < 3:
         return None, None, None, None
 
-    # Always use COMPLETED candles only — skip the in-progress candle.
+    # Always use COMPLETED candles only â€” skip the in-progress candle.
     # Kite returns the current forming candle as the last row. At 09:32 the
     # 09:30 candle has no upper wick yet (looks clean), but by 09:35 close it
     # may have a large wick that fails the clean-candle check. Using a partial
@@ -885,7 +887,7 @@ def check_signals_relaxed(df5):
     if is_doji:
         return "SKIP", price, None, None
 
-    # 4 conditions — VWAP + Supertrend + Breakout + Bull clean candle
+    # 4 conditions â€” VWAP + Supertrend + Breakout + Bull clean candle
     cond_vwap  = price > vwap
     cond_st    = st == True
     cond_brk   = price > ph
@@ -911,7 +913,7 @@ def send_market_status(price, info, alerts_today):
         return
     last_heartbeat = now
 
-    ck = lambda v: "✅" if v else "❌"
+    ck = lambda v: "âœ…" if v else "âŒ"
     if info and price:
         vwap  = info.get("vwap", 0)
         c_vwap = ck(info.get("cond_vwap_bull"))
@@ -919,7 +921,7 @@ def send_market_status(price, info, alerts_today):
         c_brk  = ck(info.get("cond_brk_bull"))
         score  = sum(1 for k in ["cond_vwap_bull","cond_st_bull","cond_brk_bull"] if info.get(k))
         msg = (
-            f"🌡️ <b>Scan Window — {now.strftime('%H:%M')}</b>\n\n"
+            f"ðŸŒ¡ï¸ <b>Scan Window â€” {now.strftime('%H:%M')}</b>\n\n"
             f"NIFTY: <b>{price:.1f}</b>   VWAP: {vwap:.1f}\n"
             f"CE-only scan (BUY signals only)\n\n"
             f"<b>Conditions ({score}/3):</b>\n"
@@ -931,7 +933,7 @@ def send_market_status(price, info, alerts_today):
         )
     else:
         msg = (
-            f"🌡️ <b>Scan Window — {now.strftime('%H:%M')}</b>\n"
+            f"ðŸŒ¡ï¸ <b>Scan Window â€” {now.strftime('%H:%M')}</b>\n"
             f"NIFTY: {price:.1f if price else 'N/A'}  |  Alerts: {alerts_today}/{MAX_ALERTS}"
         )
     send_telegram(msg)
@@ -941,7 +943,7 @@ def get_expiry_label():
     day = datetime.now().weekday()
     names = {0:"Monday",1:"Tuesday",2:"Wednesday",3:"Thursday",4:"Friday"}
     if day == EXPIRY_WEEKDAY:
-        return f"{names.get(day)} Expiry ⚠️ — extra caution, fast theta decay"
+        return f"{names.get(day)} Expiry âš ï¸ â€” extra caution, fast theta decay"
     return names.get(day, "Weekend")
 
 def format_alert(signal, price, info, alert_num):
@@ -953,40 +955,40 @@ def format_alert(signal, price, info, alert_num):
     tgt      = round(price + TARGET_PTS, 2)
     be_pts   = round(price * BREAKEVEN_PCT, 1)
 
-    mode_line = "🟢 AUTO-ARMED — order placed automatically" if AUTO_ARMED else "🔵 SIGNAL-ONLY — decide entry yourself"
+    mode_line = "ðŸŸ¢ AUTO-ARMED â€” order placed automatically" if AUTO_ARMED else "ðŸ”µ SIGNAL-ONLY â€” decide entry yourself"
 
-    msg = f"""🌅 <b>BUY CE 📈</b>
+    msg = f"""ðŸŒ… <b>BUY CE ðŸ“ˆ</b>
 
-📡 <b>MORNING WINDOW</b> ({MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')} only)
+ðŸ“¡ <b>MORNING WINDOW</b> ({MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')} only)
 {mode_line}
-📅 {now_str}
-💹 BUY <b>{strike}</b>
-📊 Nifty: {price:.2f}
-🛑 SL: {sl_level} (prev low {prev_low:.1f} - {CANDLE_SL_BUFFER}pt = {sl_pts:.0f}pt risk)
-🎯 Target: {tgt} (+{TARGET_PTS}pt)
-⚖️ Breakeven: move SL to entry at +{be_pts:.0f} pts
-🔢 Alert #{alert_num}/{MAX_ALERTS}
+ðŸ“… {now_str}
+ðŸ’¹ BUY <b>{strike}</b>
+ðŸ“Š Nifty: {price:.2f}
+ðŸ›‘ SL: {sl_level} (prev low {prev_low:.1f} - {CANDLE_SL_BUFFER}pt = {sl_pts:.0f}pt risk)
+ðŸŽ¯ Target: {tgt} (+{TARGET_PTS}pt)
+âš–ï¸ Breakeven: move SL to entry at +{be_pts:.0f} pts
+ðŸ”¢ Alert #{alert_num}/{MAX_ALERTS}
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-<b>All 4 conditions ✅</b>
-  ✅ Price above VWAP
-  ✅ Supertrend bullish
-  ✅ Breakout above prev candle
-  ✅ Bull clean candle (no wick trap)
+â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
+<b>All 4 conditions âœ…</b>
+  âœ… Price above VWAP
+  âœ… Supertrend bullish
+  âœ… Breakout above prev candle
+  âœ… Bull clean candle (no wick trap)
 
-📅 {get_expiry_label()}"""
+ðŸ“… {get_expiry_label()}"""
     return msg.strip()
 
 
 
-# ─── MAIN ───
+# â”€â”€â”€ MAIN â”€â”€â”€
 def run_scanner():
     print("="*65)
-    print("  NIFTY MORNING SCANNER — CE ONLY + AUTO EXECUTION")
+    print("  NIFTY MORNING SCANNER â€” CE ONLY + AUTO EXECUTION")
     print(f"  Window: {MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')}")
     print("  4 conditions: VWAP + Supertrend + Breakout + Clean candle")
     print(f"  SL: prev candle low - {CANDLE_SL_BUFFER}pt (dynamic) | Target: {TARGET_PTS}pt fixed")
-    print("  CE (BUY) only — 92.3% win rate, 0 SL (60d backtest)")
+    print("  CE (BUY) only â€” 96.2% win rate, 0 SL (60d backtest)")
     print("  Auto-trade: DISARMED (send /start_auto to arm)")
     print("="*65)
 
@@ -995,13 +997,13 @@ def run_scanner():
     load_position_state()  # recover any position from before a restart
 
     send_telegram(
-        "🌅 <b>Morning Scanner Started</b>\n\n"
+        "ðŸŒ… <b>Morning Scanner Started</b>\n\n"
         f"Window: {MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')} only\n"
-        "Strategy: <b>CE (BUY) only — ATM, 4 conditions</b>\n"
+        "Strategy: <b>CE (BUY) only â€” ATM, 4 conditions</b>\n"
         "  VWAP + Supertrend + Breakout + Clean candle\n"
         f"  SL: prev candle low - {CANDLE_SL_BUFFER}pt | Target: {TARGET_PTS}pt\n\n"
-        "Backtest (60d): <b>92.3% win rate, 0 SL</b> in 60d\n\n"
-        "🔴 <b>Auto-trade: DISARMED</b> — signal-only mode\n"
+        "Backtest (60d): <b>96.2% win rate, 0 SL</b> in 60d\n\n"
+        "ðŸ”´ <b>Auto-trade: DISARMED</b> â€” signal-only mode\n"
         "Send /start_auto to enable real order placement\n"
         "Send /morning_help for all commands"
     )
@@ -1016,17 +1018,17 @@ def run_scanner():
             if last_date != cd:
                 alerts_today = 0; last_date = cd; last_dir = None
                 window_opened_today = False
-                print(f"\n📅 New day: {cd}")
+                print(f"\nðŸ“… New day: {cd}")
                 if login():
-                    print("🔐 Re-logged in for new day")
+                    print("ðŸ” Re-logged in for new day")
                 else:
-                    send_telegram("🆘 <b>MORNING SCANNER — NEW DAY LOGIN FAILED</b>")
+                    send_telegram("ðŸ†˜ <b>MORNING SCANNER â€” NEW DAY LOGIN FAILED</b>")
 
             if now.weekday() == EXPIRY_WEEKDAY and position is None:
-                print(f"⏳ [{now.strftime('%H:%M')}] Tuesday (expiry) — no morning signals")
+                print(f"â³ [{now.strftime('%H:%M')}] Tuesday (expiry) â€” no morning signals")
                 sleep_poll(300); continue
 
-            # ─── POSITION MONITORING (runs all day regardless of window) ───
+            # â”€â”€â”€ POSITION MONITORING (runs all day regardless of window) â”€â”€â”€
             if position is not None:
                 check_gtt_triggered()   # detect if GTT (SL/target) fired externally
                 if position is not None:
@@ -1037,45 +1039,45 @@ def run_scanner():
                         monitor_position(current_price)
                 sleep_poll(60); continue
 
-            # ─── OUTSIDE SCAN WINDOW — idle ───
+            # â”€â”€â”€ OUTSIDE SCAN WINDOW â€” idle â”€â”€â”€
             if ct < MORNING_START or ct > MORNING_END:
-                print(f"⏳ [{now.strftime('%H:%M')}] Outside scan window (9:30-13:00) — idle")
+                print(f"â³ [{now.strftime('%H:%M')}] Outside scan window (9:30-13:00) â€” idle")
                 sleep_poll(120); continue
 
             if not window_opened_today:
                 window_opened_today = True
-                armed_label = "🟢 AUTO-ARMED — will place real orders" if AUTO_ARMED else "🔴 Signal-only (send /start_auto to arm)"
+                armed_label = "ðŸŸ¢ AUTO-ARMED â€” will place real orders" if AUTO_ARMED else "ðŸ”´ Signal-only (send /start_auto to arm)"
                 send_telegram(
-                    f"🌅 <b>Scan Window OPEN</b>\n\n"
-                    f"⏰ {now.strftime('%H:%M')} — Scanning till {MORNING_END.strftime('%H:%M')}\n"
-                    "Strategy: <b>CE (BUY) only — ATM, 4 conditions</b>\n"
+                    f"ðŸŒ… <b>Scan Window OPEN</b>\n\n"
+                    f"â° {now.strftime('%H:%M')} â€” Scanning till {MORNING_END.strftime('%H:%M')}\n"
+                    "Strategy: <b>CE (BUY) only â€” ATM, 4 conditions</b>\n"
                     "  VWAP + Supertrend + Breakout + Clean candle\n"
                     f"  SL: prev low - {CANDLE_SL_BUFFER}pt | Target: {TARGET_PTS}pt\n"
-                    f"Backtest: <b>92.3% win rate, 0 SL</b> in 60 days\n\n"
+                    f"Backtest: <b>96.2% win rate, 0 SL</b> in 60 days\n\n"
                     f"{armed_label}"
                 )
 
             if alerts_today >= MAX_ALERTS:
-                print(f"🚫 Max alerts reached ({MAX_ALERTS}) — idle till next day")
+                print(f"ðŸš« Max alerts reached ({MAX_ALERTS}) â€” idle till next day")
                 sleep_poll(120); continue
 
             df5 = fetch_data(NIFTY_TOKEN, "5minute", days=5)
             if df5 is None:
-                print("❌ Data failed"); sleep_poll(60); continue
+                print("âŒ Data failed"); sleep_poll(60); continue
 
             signal, price, info, opt_type = check_signals_relaxed(df5)
             if price:
                 print(f"  [{now.strftime('%H:%M')}] Nifty:{price:.2f} | Signal:{signal or 'None'} | Auto:{'ON' if AUTO_ARMED else 'OFF'}")
 
             if signal == "SKIP":
-                print("  ⛔ Doji — skipping")
+                print("  â›” Doji â€” skipping")
             elif signal in ("BUY", "SELL"):
                 if signal == last_dir:
-                    print(f"  ⏭️ Duplicate {signal} — skipping")
+                    print(f"  â­ï¸ Duplicate {signal} â€” skipping")
                 else:
                     alerts_today += 1; last_dir = signal
                     last_heartbeat = now
-                    print(f"  🌅 {signal} alert #{alerts_today} | AUTO_ARMED={AUTO_ARMED}")
+                    print(f"  ðŸŒ… {signal} alert #{alerts_today} | AUTO_ARMED={AUTO_ARMED}")
                     send_telegram(format_alert(signal, price, info, alerts_today))
 
                     # Auto-execute if armed and no open position
@@ -1083,18 +1085,18 @@ def run_scanner():
                         prev_low = info.get("prev_low", price * 0.998) if info else price * 0.998
                         execute_entry(signal, price, prev_low)
                     elif AUTO_ARMED and position is not None:
-                        send_telegram(f"ℹ️ Signal fired but position already open ({position['symbol']}) — skipping new entry")
+                        send_telegram(f"â„¹ï¸ Signal fired but position already open ({position['symbol']}) â€” skipping new entry")
 
             if price and info:
                 send_market_status(price, info, alerts_today)
 
-            sleep_poll(60)
+            sleep_poll(30)
 
         except KeyboardInterrupt:
-            print("\n⛔ Morning scanner stopped.")
-            send_telegram("⛔ Morning scanner stopped."); break
+            print("\nâ›” Morning scanner stopped.")
+            send_telegram("â›” Morning scanner stopped."); break
         except Exception as e:
-            print(f"❌ Error: {e}"); sleep_poll(60)
+            print(f"âŒ Error: {e}"); sleep_poll(60)
 
 if __name__ == "__main__":
     run_scanner()
