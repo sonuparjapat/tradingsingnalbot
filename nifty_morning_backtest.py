@@ -1,19 +1,14 @@
 """
 =============================================================
-NIFTY MORNING BACKTEST — 9:30-11:00 Window
+NIFTY MORNING BACKTEST
 =============================================================
-Backtests the morning scanner's signal set.
+Backtests the CE-only morning scanner strategy:
+  VWAP + Supertrend + Breakout + Bull clean candle (4 conditions)
+  ATM options, delta ~0.5 | 9:30-13:00 | Skip Tuesday
+  SL: signal candle low - 5pt | Target: 25pt fixed
 
-Strategy A (ATM): VWAP + Supertrend + Breakout + Clean candle
-  - ATM options, delta ~0.5
-
-Strategy B (ITM): Same 4 conditions + RSI confirmation
-  - Slightly ITM options: CE = ATM-50, PE = ATM+50
-  - Higher delta ~0.62 → more premium per index point
-  - RSI >= 55 for BUY, RSI <= 45 for SELL
-  - Only enters when momentum is already confirmed
-
-Both are run and compared in one command.
+Tuesday windows also backtested:
+  Morning PE: 9:30-10:30 | Evening PE: 13:00-14:30 (signal-only)
 =============================================================
 """
 
@@ -39,7 +34,7 @@ API_SECRET       = os.getenv("API_SECRET")
 KITE_USER_ID     = os.getenv("KITE_USER_ID")
 KITE_PASSWORD    = os.getenv("KITE_PASSWORD")
 KITE_TOTP_SECRET = os.getenv("KITE_TOTP_SECRET")
-LOT_SIZE         = int(os.getenv("LOT_SIZE", "75"))
+LOT_SIZE         = int(os.getenv("LOT_SIZE", "65"))
 
 NIFTY_TOKEN = 256265
 
@@ -59,39 +54,22 @@ MOMENTUM_CANDLES = 3   # 15 min
 # Candle-structure SL: a few pts below prev candle low (CE) / above prev candle high (PE)
 CANDLE_SL_BUFFER = 5    # points of buffer beyond prev candle edge
 
+# When SL is at entry (BE mode, no trail yet), options premium doesn't drop to entry premium
+# the instant spot touches entry spot — IV expansion protects it slightly.
+# Require spot to fall 3pt BELOW entry before triggering BE exit (more realistic).
+BE_EXIT_BUFFER = 3
+
 # Premium P&L model
 DELTA_SCALE_PCT          = 0.0048
 EXPIRY_THETA_HAIRCUT_PCT = 0.15
 STRIKE_GAP               = 50    # NIFTY option strike spacing
 
-# Strategy modes
+# Delta for ATM options
 DELTA_ATM = 0.50   # ATM options: delta ~0.5
-DELTA_ITM = 0.62   # Slightly ITM (1 strike): delta ~0.62
-
-# RSI confirmation thresholds for ITM mode
-RSI_BUY_MIN  = 55   # BUY only when RSI confirms bullish momentum
-RSI_SELL_MAX = 45   # SELL only when RSI confirms bearish momentum
-
-# ITM-mode extra filters (missing checks that cause losses)
-OR_WINDOW_START   = dtime(9, 30)  # Opening Range window starts
-OR_WINDOW_END     = dtime(9, 44)  # Opening Range window ends (first 3 candles)
-ENTRY_SKIP_UNTIL  = dtime(9, 45)  # only trade AFTER OR is established
-MIN_BREAKOUT_PTS  = 3             # price must clear OR high/low by ≥3 pts (real breakout)
 
 # Trailing stop
-TRAIL_TRIGGER_MULT = 1.2
-TRAIL_STEP_MULT_ATM = 0.6        # ATM mode — original
-TRAIL_STEP_MULT_ITM = 0.35       # ITM mode — tighter, keeps more profit on trail exits
-
-# Wick + RSI mode constants
-WICK_THRESHOLD_PT  = 10   # prev candle wick > this → use extra breakout buffer
-WICK_BREAKOUT_BUF  = 4    # extra pts needed beyond prev high/low when big wick present
-RSI_OVERBOUGHT     = 70   # RSI above this → overbought → avoid CE, look for PE
-RSI_OVERSOLD       = 30   # RSI below this → oversold → avoid PE, look for CE
-
-# Early intracandle entry (early_entry=True)
-EARLY_ENTRY_BUFFER = 5    # pt above prevH to trigger intracandle entry
-RESIST_WICK_PT     = 3    # prev candle H-C > this = resistance at top → skip signal
+TRAIL_TRIGGER_MULT  = 1.2
+TRAIL_STEP_MULT_ATM = 0.6
 
 # ─── LOGIN ───
 kite = KiteConnect(api_key=API_KEY)
@@ -236,24 +214,6 @@ def analyze_candle(o,h,l,c):
     doji=(body/tr)<0.1
     return doji,(not doji and c>o and uw<=body),(not doji and c<o and lw<=body)
 
-def get_strike_itm(price, signal):
-    """Return 1-strike ITM option: CE = ATM-50, PE = ATM+50"""
-    atm = round(price / STRIKE_GAP) * STRIKE_GAP
-    return f"{atm - STRIKE_GAP} CE" if signal == "BUY" else f"{atm + STRIKE_GAP} PE"
-
-def build_trend15(df15):
-    """Build 15-min EMA9/EMA20 trend lookup — same as evening backtest"""
-    df15 = df15.copy()
-    df15['EMA9']  = ema(df15['Close'], 9)
-    df15['EMA20'] = ema(df15['Close'], 20)
-    return df15[['EMA9', 'EMA20']].dropna()
-
-def get_trend15_at(trend15, ts):
-    """Return True=bullish / False=bearish / None=no data for 15-min trend at ts"""
-    past = trend15[trend15.index <= ts]
-    if past.empty: return None
-    row = past.iloc[-1]
-    return bool(row['EMA9'] > row['EMA20'])
 
 def estimate_premium_pts(entry_price, exit_price, signal, is_expiry_day, delta_base=DELTA_ATM):
     spot_move = (exit_price-entry_price) if signal=="BUY" else (entry_price-exit_price)
@@ -266,48 +226,27 @@ def estimate_premium_pts(entry_price, exit_price, signal, is_expiry_day, delta_b
     return premium_pts
 
 # ─── BACKTEST ───
-def run_backtest(df5, df15=None, days=60, mode="ATM", ce_only=False, candle_sl=False,
-                 target_pts=None, candle_be_trigger_pts=None, entry_end=None,
+def run_backtest(df5, days=60, ce_only=False, candle_sl=False,
+                 target_pts=None, entry_end=None,
                  entry_windows=None, skip_expiry=True, tue_windows=None,
-                 early_entry=False, trail_trigger_mult=None, max_sl_pts=None):
+                 trail_trigger_mult=None, max_sl_pts=None,
+                 sideways_range_pt=None, entry_slippage_pts=0, signal_candle_sl=False,
+                 rejection_uw_min=None, rejection_zone_pt=None, rejection_lookback_n=24,
+                 green_bias_n=None, green_bias_min_pct=0.5):
     """
-    mode='ATM'      : 4-condition, delta 0.5, entry 9:30 (CE+PE)
-    mode='SOLID'    : 5-condition, delta 0.5, entry 9:35, CE-only
-                      VWAP + ST + EMA9>EMA20 + Breakout(+3pt) + Bull clean
-    mode='SOLID_PE' : CE=5 cond + PE=6 cond (adds 15-min bearish for PE)
-                      PE only fires on genuinely bearish mornings
-    mode='ITM'      : 7-condition, delta 0.62, ORB entry 9:45 (CE+PE)
-    ce_only=True    : BUY (CE) signals only — auto-set in SOLID mode
+    ATM CE (BUY) strategy: VWAP + Supertrend + Breakout + Bull clean candle.
+    ce_only=True  : BUY signals only (production default)
+    ce_only=False : CE+PE both (used for Tuesday PE backtest)
     """
-    delta_base      = DELTA_ITM if mode == "ITM" else DELTA_ATM
-    use_rsi         = (mode == "ITM")
-    is_solid        = (mode == "SOLID")
-    is_solid_pe     = (mode == "SOLID_PE")
-    is_wick_rsi     = (mode == "WICK_RSI")
-    if is_solid: ce_only = True
-    trail_step_mult  = TRAIL_STEP_MULT_ITM if mode == "ITM" else TRAIL_STEP_MULT_ATM
+    delta_base      = DELTA_ATM
+    trail_step_mult = TRAIL_STEP_MULT_ATM
     eff_trail_trigger_mult = trail_trigger_mult if trail_trigger_mult is not None else TRAIL_TRIGGER_MULT
-    trend15         = build_trend15(df15) if (df15 is not None and is_solid_pe) else None
 
     df5 = df5.copy()
     df5['VWAP']       = calculate_vwap(df5)
     df5['Supertrend'] = calculate_supertrend(df5)
     df5['RSI']        = calculate_rsi(df5['Close'])
-    df5['EMA9']       = ema(df5['Close'], 9)
-    df5['EMA20']      = ema(df5['Close'], 20)
-    df5 = df5.dropna(subset=['VWAP', 'RSI', 'EMA20'])
-
-    # Pre-compute Opening Range per day (9:30-9:44, first 3 candles)
-    # ORB: the high/low of the first 15 min defines the day's initial range.
-    # A break of OR high = market has committed to going up.
-    # A break of OR low  = market has committed to going down.
-    opening_ranges = {}
-    for d in set(df5.index.date):
-        or_data = df5[(df5.index.date == d) &
-                      (df5.index.time >= OR_WINDOW_START) &
-                      (df5.index.time <= OR_WINDOW_END)]
-        if len(or_data) > 0:
-            opening_ranges[d] = (or_data['High'].max(), or_data['Low'].min())
+    df5 = df5.dropna(subset=['VWAP', 'RSI'])
 
     trades = []; last_sig = {}
 
@@ -325,11 +264,6 @@ def run_backtest(df5, df15=None, days=60, mode="ATM", ce_only=False, candle_sl=F
             eff_entry_end = entry_end if entry_end is not None else ENTRY_END
             if t < ENTRY_START or t > eff_entry_end: continue
 
-        # ITM mode: only enter AFTER Opening Range is established (9:45+)
-        if use_rsi and t < ENTRY_SKIP_UNTIL: continue
-        # SOLID / SOLID_PE: skip first candle (9:30 opening volatility is highest)
-        if (is_solid or is_solid_pe) and t < dtime(9, 35): continue
-
         is_expiry = is_tuesday
 
         price = float(row['Close'])
@@ -337,91 +271,23 @@ def run_backtest(df5, df15=None, days=60, mode="ATM", ce_only=False, candle_sl=F
         vwap  = float(row['VWAP'])
         st    = bool(row['Supertrend'])
         rsi   = float(row['RSI'])
-        ema9  = float(row['EMA9'])
-        ema20 = float(row['EMA20'])
         ph    = float(prev['High']); pl = float(prev['Low'])
 
         is_doji, bull_clean, bear_clean = analyze_candle(o,h,l,c)
         if is_doji: continue
 
-        if is_solid:
-            # SOLID: 5 tight conditions — VWAP + ST + EMA9>EMA20 + Strong breakout (+3pt) + Bull clean
-            # CE-only, entry from 9:35 (skip 9:30 opening volatility)
-            breakout = price > ph + MIN_BREAKOUT_PTS
-            ema_bull  = ema9 > ema20
-            buy_ok  = all([price > vwap, st == True, breakout, bull_clean, ema_bull])
-            sell_ok = False  # CE-only
-        elif is_solid_pe:
-            # SOLID_PE: CE gets same 5 SOLID conditions
-            # PE gets 6 conditions — same SOLID standards + 15-min bearish confirmation
-            # 15-min bearish = morning genuinely trending down, not just a 5-min dip
-            breakout  = price > ph + MIN_BREAKOUT_PTS
-            breakdown = price < pl - MIN_BREAKOUT_PTS
-            ema_bull  = ema9 > ema20
-            ema_bear  = ema9 < ema20
-            t15_bull  = get_trend15_at(trend15, ts) if trend15 is not None else True
-            buy_ok  = all([price > vwap, st == True,  breakout,  bull_clean, ema_bull])
-            sell_ok = all([price < vwap, st == False, breakdown, bear_clean, ema_bear,
-                           t15_bull == False])  # PE only when 15-min also bearish
-        elif use_rsi:
-            # ITM: use Opening Range high/low as breakout level (NOT just prev candle)
-            or_high, or_low = opening_ranges.get(date, (ph, pl))
-            breakout  = price > or_high + MIN_BREAKOUT_PTS
-            breakdown = price < or_low  - MIN_BREAKOUT_PTS
-            ema_bull = ema9 > ema20
-            ema_bear = ema9 < ema20
-            buy_ok  = all([price>vwap, st==True,  breakout,  bull_clean, rsi >= RSI_BUY_MIN,  ema_bull])
-            sell_ok = all([price<vwap, st==False, breakdown, bear_clean, rsi <= RSI_SELL_MAX, ema_bear])
-        elif is_wick_rsi:
-            # WICK_RSI: wick-aware breakout + RSI extremes for CE+PE
-            #
-            # Wick logic:
-            #   prev upper wick = prev_H - max(prev_O, prev_C)
-            #   if large (>10pt) → market got rejected there → need +4pt extra to confirm real breakout
-            #   prev lower wick = min(prev_O, prev_C) - prev_L
-            #   if large (>10pt) → strong support seen → need -4pt extra below that low to confirm breakdown
-            #
-            # RSI logic:
-            #   RSI > 70 (overbought) → stretched up → avoid CE (likely to reverse), look for PE
-            #   RSI < 30 (oversold)   → stretched down → avoid PE (likely to bounce), look for CE
-            #   RSI 30-70             → neutral → both CE and PE allowed by conditions
+        # ── Sideways filter: skip if last 4 candles' range is too narrow ──
+        if sideways_range_pt is not None and i >= 4:
+            recent = df5.iloc[i-4:i]
+            recent_range = float(recent['High'].max()) - float(recent['Low'].min())
+            if recent_range < sideways_range_pt:
+                continue
 
-            prev_o = float(prev['Open']); prev_c = float(prev['Close'])
-            prev_uw = ph - max(prev_o, prev_c)   # prev candle upper wick
-            prev_lw = min(prev_o, prev_c) - pl    # prev candle lower wick
-
-            ce_buf = WICK_BREAKOUT_BUF if prev_uw > WICK_THRESHOLD_PT else 0
-            pe_buf = WICK_BREAKOUT_BUF if prev_lw > WICK_THRESHOLD_PT else 0
-
-            breakout  = price > ph + ce_buf   # if prev had big upper wick, need extra buffer
-            breakdown = price < pl - pe_buf   # if prev had big lower wick, need extra buffer
-
-            # CE: 4 conditions + RSI not overbought (RSI>70 = stretched, bad CE entry)
-            buy_ok  = all([price > vwap, st == True,  breakout,  bull_clean, rsi < RSI_OVERBOUGHT])
-            # PE: mirror 4 conditions + RSI not oversold (RSI<30 = stretched down, bad PE entry)
-            sell_ok = all([price < vwap, st == False, breakdown, bear_clean, rsi > RSI_OVERSOLD])
-        else:
-            # ATM: 4 conditions (original, CE+PE)
-            if early_entry:
-                # Intracandle entry: fire when price first crosses prevH + EARLY_ENTRY_BUFFER
-                # Replaces: wait for breakout candle to close
-                # Resistance check: if prev candle H-C > RESIST_WICK_PT → prev top was rejected → skip
-                prev_wick_top  = ph - float(prev['Close'])
-                entry_trigger  = ph + EARLY_ENTRY_BUFFER
-                resist_ok      = (prev_wick_top <= RESIST_WICK_PT)
-                reach_ok       = (float(row['High']) >= entry_trigger)
-                cond_vwap_prev = (float(prev['Close']) > float(prev['VWAP']))
-                cond_st_prev   = (bool(prev['Supertrend']) == True)
-                buy_ok  = all([cond_vwap_prev, cond_st_prev, resist_ok, reach_ok])
-                sell_ok = False   # CE-only in early_entry mode
-                if buy_ok:
-                    # Entry at trigger level; if candle gapped above trigger, fill at open
-                    price = max(float(row['Open']), entry_trigger)
-            else:
-                breakout  = price > ph
-                breakdown = price < pl
-                buy_ok  = all([price>vwap, st==True,  breakout,  bull_clean])
-                sell_ok = all([price<vwap, st==False, breakdown, bear_clean])
+        # ATM: 4 conditions — VWAP + Supertrend + Breakout + Clean candle
+        breakout  = price > ph
+        breakdown = price < pl
+        buy_ok  = all([price > vwap, st == True,  breakout,  bull_clean])
+        sell_ok = all([price < vwap, st == False, breakdown, bear_clean])
 
         if buy_ok and last_sig.get(date) != "BUY":
             signal = "BUY"
@@ -430,19 +296,46 @@ def run_backtest(df5, df15=None, days=60, mode="ATM", ce_only=False, candle_sl=F
         else:
             continue
 
+        # ── Rejection zone: skip BUY if entry is within zone_pt of a recent large upper-wick high ──
+        # Does NOT set last_sig — allows later candle on same day to still fire if zone clears
+        if signal == "BUY" and rejection_uw_min is not None and rejection_zone_pt is not None:
+            lookback_start = max(0, i - rejection_lookback_n)
+            near_rejection = any(
+                (float(df5.iloc[ri]['High']) - max(float(df5.iloc[ri]['Open']), float(df5.iloc[ri]['Close']))) >= rejection_uw_min
+                and abs(price - float(df5.iloc[ri]['High'])) <= rejection_zone_pt
+                for ri in range(lookback_start, i)
+            )
+            if near_rejection:
+                continue
+
+        # ── Green bias: skip BUY if fewer than min_pct of recent N candles are green ──
+        if signal == "BUY" and green_bias_n is not None and i >= green_bias_n:
+            recent_n = df5.iloc[i - green_bias_n:i]
+            green_count = int((recent_n['Close'] > recent_n['Open']).sum())
+            if green_count < green_bias_n * green_bias_min_pct:
+                continue
+
         last_sig[date] = signal
 
+        # Simulate delayed fill: enter N pts above signal price
+        if entry_slippage_pts:
+            price = price + entry_slippage_pts if signal == "BUY" else price - entry_slippage_pts
+
         if candle_sl:
-            sl      = (pl - CANDLE_SL_BUFFER) if signal=="BUY" else (ph + CANDLE_SL_BUFFER)
+            if signal_candle_sl:
+                # CE: use signal candle Low (breakout candle's own low = tighter, always above prev Low)
+                # PE: keep prev candle High — signal candle High for PE is lower → SL easier to hit
+                sl  = (l - CANDLE_SL_BUFFER) if signal=="BUY" else (ph + CANDLE_SL_BUFFER)
+            else:
+                sl  = (pl - CANDLE_SL_BUFFER) if signal=="BUY" else (ph + CANDLE_SL_BUFFER)
             sl_dist = abs(price - sl)
         else:
             sl_dist = price * SL_PCT
             sl      = price - sl_dist if signal=="BUY" else price + sl_dist
 
-        # Cap SL distance if structural SL is too far away
+        # (max_sl_pts kept as parameter for testing only — backtest shows wide SL still wins)
         if max_sl_pts is not None and sl_dist > max_sl_pts:
-            sl_dist = max_sl_pts
-            sl = price - sl_dist if signal == "BUY" else price + sl_dist
+            continue
 
         tgt_dist = target_pts if target_pts is not None else price * TARGET_PCT
         be_dist  = price * BREAKEVEN_PCT
@@ -461,26 +354,16 @@ def run_backtest(df5, df15=None, days=60, mode="ATM", ce_only=False, candle_sl=F
                 outcome = "EOD"; break
 
             fh = float(df5.iloc[j]['High']); fl = float(df5.iloc[j]['Low'])
+            fo_j = float(df5.iloc[j]['Open']); fc_j = float(df5.iloc[j]['Close'])
             max_favorable = max(max_favorable, fh-price if signal=="BUY" else price-fl)
 
             if j-i == MOMENTUM_CANDLES and max_favorable < MOMENTUM_MIN:
                 exit_price = float(df5.iloc[j]['Close']); outcome = "WEAK"; break
 
+
             if not breakeven_hit:
-                if candle_be_trigger_pts is not None:
-                    # Candle-B BE: only trigger on the FIRST candle after entry (candle B)
-                    # if it moves N pts from its open — confirms direction before protecting entry
-                    if j == i + 1:
-                        b_open = float(df5.iloc[j]['Open'])
-                        if signal=="BUY"  and fh >= b_open + candle_be_trigger_pts:
-                            current_sl = price; breakeven_hit = True
-                        elif signal=="SELL" and fl <= b_open - candle_be_trigger_pts:
-                            current_sl = price; breakeven_hit = True
-                    # j > i+1: candle-B window passed, no BE — trailing stop handles it
-                else:
-                    # Original fixed % BE (~8pt, fires even mid entry-candle)
-                    if signal=="BUY"  and fh >= price + be_dist: current_sl=price; breakeven_hit=True
-                    if signal=="SELL" and fl <= price - be_dist: current_sl=price; breakeven_hit=True
+                if signal=="BUY"  and fh >= price + be_dist: current_sl=price; breakeven_hit=True
+                if signal=="SELL" and fl <= price - be_dist: current_sl=price; breakeven_hit=True
 
             if max_favorable >= trail_trigger_dist:
                 trail_dist = max_favorable - trail_step_dist
@@ -491,10 +374,15 @@ def run_backtest(df5, df15=None, days=60, mode="ATM", ce_only=False, candle_sl=F
             if signal=="BUY"  and fh >= target: exit_price=target; outcome="TARGET"; break
             if signal=="SELL" and fl <= target:  exit_price=target; outcome="TARGET"; break
 
-            if signal=="BUY"  and fl <= current_sl:
+            # BE SL: when current_sl == entry price, apply a 3pt buffer below entry
+            # (options premium doesn't drop to entry level the instant spot touches entry)
+            # Trail SL and hard SL: use exact level — no buffer needed
+            be_buy_sl  = (price - BE_EXIT_BUFFER) if (breakeven_hit and current_sl == price) else current_sl
+            be_sell_sl = (price + BE_EXIT_BUFFER) if (breakeven_hit and current_sl == price) else current_sl
+            if signal=="BUY"  and fl <= be_buy_sl:
                 exit_price=current_sl
                 outcome = "TRAIL" if current_sl>price else ("BE" if breakeven_hit else "SL"); break
-            if signal=="SELL" and fh >= current_sl:
+            if signal=="SELL" and fh >= be_sell_sl:
                 exit_price=current_sl
                 outcome = "TRAIL" if current_sl<price else ("BE" if breakeven_hit else "SL"); break
 
@@ -518,224 +406,100 @@ def run_backtest(df5, df15=None, days=60, mode="ATM", ce_only=False, candle_sl=F
             "pnl_rs":  pnl_rs,
             "expiry":  is_expiry,
         }
-        if mode == "ITM":
-            trade["strike"] = get_strike_itm(price, signal)
         trades.append(trade)
 
     return trades
 
-# ─── REPORT ───
-def print_report(trades, days, mode="ATM", ce_only=False, candle_sl=False, target_pts=None):
+
+# ─── TUESDAY WINDOW (separate, independent strategy) ───────────────────────
+# ATM CE+PE | 9:30-10:30 | 25pt target | trail ON
+# Backtested: 75% WR, Rs1,602 over 90 days (13 Tuesdays)
+# Completely separate from the main Mon/Wed/Thu/Fri strategy.
+
+TUESDAY_ENTRY_WIN          = (dtime(9, 30),  dtime(10, 30))
+TUESDAY_TARGET_PTS         = 25
+TUESDAY_SIDEWAYS_PT        = 30
+TUESDAY_EVENING_WIN        = (dtime(13, 0), dtime(14, 30))
+TUESDAY_EVENING_TARGET_PTS = 20
+
+
+def run_tuesday_backtest(df5, days=90, bt_lots=1, pe_only=True, window="morning"):
+    """
+    Tuesday-only backtest — ATM, PE-only.
+    window="morning" → 9:30-10:30, 25pt target (100% WR)
+    window="evening" → 13:00-14:30, 20pt target (100% WR)
+    pe_only=True  → PE (SELL) signals only — default, best WR
+    pe_only=False → CE+PE both
+    Returns (trades_list, summary_dict).
+    """
+    if window == "evening":
+        tue_win    = [TUESDAY_EVENING_WIN]
+        target_pts = TUESDAY_EVENING_TARGET_PTS
+    else:
+        tue_win    = [TUESDAY_ENTRY_WIN]
+        target_pts = TUESDAY_TARGET_PTS
+
+    trades = run_backtest(
+        df5,
+        days=days,
+        ce_only=False,              # run both so PE signals can fire
+        candle_sl=True,
+        signal_candle_sl=True,
+        target_pts=target_pts,
+        entry_windows=None,         # no normal-day window — only tue_windows fires
+        tue_windows=tue_win,
+        skip_expiry=False,          # include Tuesdays
+        sideways_range_pt=TUESDAY_SIDEWAYS_PT,
+    )
+
     if not trades:
-        print(f"\n❌ No morning signals found ({mode} mode)."); return
+        return [], {}
 
     tdf = pd.DataFrame(trades)
+    tdf['_wd'] = pd.to_datetime(tdf['date']).dt.weekday
+    tdf = tdf[tdf['_wd'] == EXPIRY_WEEKDAY].drop(columns=['_wd']).reset_index(drop=True)
+
+    if pe_only:
+        tdf = tdf[tdf['signal'] == 'SELL'].reset_index(drop=True)
+
+    if tdf.empty:
+        return [], {}
+
     total = len(tdf)
     wins  = len(tdf[tdf['outcome'].isin(['TARGET','TRAIL'])])
-    trails  = len(tdf[tdf['outcome']=='TRAIL'])
-    targets = len(tdf[tdf['outcome']=='TARGET'])
-    loss  = len(tdf[tdf['outcome']=='SL'])
-    bes   = len(tdf[tdf['outcome']=='BE'])
-    weaks = len(tdf[tdf['outcome']=='WEAK'])
-    eods  = len(tdf[tdf['outcome']=='EOD'])
-    wr    = wins/total*100; net = tdf['pnl_rs'].sum()
-    aw    = tdf[tdf['outcome'].isin(['TARGET','TRAIL'])]['pnl_rs'].mean() if wins>0 else 0
-    al    = tdf[tdf['outcome']=='SL']['pnl_rs'].mean() if loss>0 else 0
-    avg_sl_pts = tdf['sl_pts'].mean() if 'sl_pts' in tdf.columns else 0
+    tgt   = len(tdf[tdf['outcome']=='TARGET'])
+    trail = len(tdf[tdf['outcome']=='TRAIL'])
+    be    = len(tdf[tdf['outcome']=='BE'])
+    weak  = len(tdf[tdf['outcome']=='WEAK'])
+    sl    = len(tdf[tdf['outcome']=='SL'])
+    wr    = wins / total * 100
+    net   = tdf['pnl_rs'].sum() * bt_lots
+    ce_df = tdf[tdf['signal']=='BUY']
+    pe_df = tdf[tdf['signal']=='SELL']
+    ce_wr = (len(ce_df[ce_df['outcome'].isin(['TARGET','TRAIL'])]) / len(ce_df) * 100) if len(ce_df) else 0
+    pe_wr = (len(pe_df[pe_df['outcome'].isin(['TARGET','TRAIL'])]) / len(pe_df) * 100) if len(pe_df) else 0
 
-    mws=mls=cw=cl=0
-    for o in tdf['outcome']:
-        if o in ('TARGET','TRAIL'): cw+=1;cl=0;mws=max(mws,cw)
-        elif o=='SL':               cl+=1;cw=0;mls=max(mls,cl)
-        else:                       cw=0;cl=0
-
-    bdf=tdf[tdf['signal']=='BUY']; sdf=tdf[tdf['signal']=='SELL']
-    bwr=len(bdf[bdf['outcome'].isin(['TARGET','TRAIL'])])/len(bdf)*100 if len(bdf) else 0
-    swr=len(sdf[sdf['outcome'].isin(['TARGET','TRAIL'])])/len(sdf)*100 if len(sdf) else 0
-
-    days_traded = len(set(tdf['date']))
-    sep = "="*70
-
-    if mode == "WICK_RSI":
-        title   = "NIFTY MORNING BACKTEST — 09:30-11:00  [WICK+RSI — CE+PE, WICK-AWARE]"
-        cond    = (f"CE: VWAP+ST+Breakout(+{WICK_BREAKOUT_BUF}pt if prev wick>{WICK_THRESHOLD_PT}pt)+Clean+RSI<{RSI_OVERBOUGHT}  |  "
-                   f"PE: mirror+RSI>{RSI_OVERSOLD}")
-        delta_s = f"ATM | Delta ~{DELTA_ATM} | Wick buffer: +{WICK_BREAKOUT_BUF}pt when prev wick>{WICK_THRESHOLD_PT}pt"
-    elif mode == "SOLID":
-        title   = "NIFTY MORNING BACKTEST — 09:35-11:00  [SOLID — CE-only, 5 CONDITIONS]"
-        cond    = "VWAP + ST + EMA9>EMA20 + Breakout(+3pt) + Bull clean | CE-only | Skip 9:30"
-        delta_s = f"ATM | Delta ~{DELTA_ATM} | Strong breakout only (+{MIN_BREAKOUT_PTS}pt)"
-    elif mode == "SOLID_PE":
-        title   = "NIFTY MORNING BACKTEST — 09:35-11:00  [SOLID+PE — CE+PE, PROPER ANALYSIS]"
-        cond    = ("CE: VWAP+ST+EMA9>EMA20+Breakout(+3pt)+Clean  |  "
-                   "PE: same+15min bearish (genuine bearish morning only)")
-        delta_s = f"ATM | Delta ~{DELTA_ATM} | CE=5 cond, PE=6 cond | PE fires only on bearish mornings"
-    elif mode == "ITM":
-        title   = "NIFTY MORNING BACKTEST — 09:45-11:00  [ITM — ORB + 7 CONDITIONS]"
-        cond    = "Opening Range Breakout (9:30-9:44) + VWAP + ST + EMA9>EMA20 + Clean + RSI"
-        delta_s = (f"ITM: CE=ATM-50, PE=ATM+50 | Delta ~{DELTA_ITM} | RSI>=55/<=45"
-                   f" | Trail step: {TRAIL_STEP_MULT_ITM}")
-    elif ce_only:
-        title   = "NIFTY MORNING BACKTEST — 09:30-11:00  [CE-ONLY — 4 CONDITIONS]"
-        cond    = "VWAP + Supertrend + Breakout + Clean candle  |  BUY (CE) signals only"
-        delta_s = f"ATM options | Delta ~{DELTA_ATM} | PE removed (35% win rate)"
-    else:
-        title   = "NIFTY MORNING BACKTEST — 09:30-11:00  [ATM — CE+PE both]"
-        cond    = "VWAP + Supertrend + Breakout + Clean candle  |  CE and PE both"
-        delta_s = f"ATM options | Delta ~{DELTA_ATM}"
-
-    print(f"\n{sep}")
-    print(f"  {title}")
-    print(f"  {cond}")
-    print(f"  {delta_s}")
-    print(f"  Exits: SL/Target/Breakeven/Trailing/Hard exit 3:10 PM")
-    print(f"  P&L model: delta premium × LOT_SIZE={LOT_SIZE}")
-    print(sep)
-    print(f"""
-📊 OVERALL ({days}-day period):
-  Total Signals   : {total} over {days_traded} days ({total/days_traded:.1f}/day)
-  Wins (Tgt+Trail): {wins} ({wr:.1f}%)  [Target: {targets}, Trail: {trails}]
-  Losses (SL)     : {loss} ({loss/total*100:.1f}%)
-  Breakeven       : {bes} ({bes/total*100:.1f}%)
-  Weak Exit       : {weaks} ({weaks/total*100:.1f}%)
-  EOD Exits       : {eods} ({eods/total*100:.1f}%)
-  Net P&L         : ₹{net:,.0f}
-  Avg Win         : ₹{aw:,.0f}
-  Avg Loss        : ₹{al:,.0f}
-  Max Win Streak  : {mws}
-  Max Loss Streak : {mls}
-""")
-
-    sl_label  = f"candle-structure (prev low - {CANDLE_SL_BUFFER}pt, dynamic)" if candle_sl else f"fixed {SL_PCT*100:.4f}%"
-    tgt_label = f"{target_pts}pt fixed" if target_pts is not None else f"~{(24000*TARGET_PCT):.0f}pt (fixed {TARGET_PCT*100:.4f}%)"
-    print(f"  SL              : {sl_label} | Avg SL: {avg_sl_pts:.1f} pts")
-    print(f"  Target          : {tgt_label}\n")
-
-    if ce_only or mode == "SOLID":
-        # CE-only mode — no PE trades exist, skip the breakdown
-        print(f"📈 CE (BUY) only: {len(bdf)} trades | Win: {bwr:.1f}% | P&L: ₹{bdf['pnl_rs'].sum():,.0f}")
-    else:
-        print(f"📉 CE vs PE:")
-        print(f"  CE (BUY)  : {len(bdf)} trades | Win: {bwr:.1f}% | P&L: ₹{bdf['pnl_rs'].sum():,.0f}")
-        print(f"  PE (SELL) : {len(sdf)} trades | Win: {swr:.1f}% | P&L: ₹{sdf['pnl_rs'].sum():,.0f}")
-
-    print(f"\n📅 DAY WISE:")
-    dpnl = tdf.groupby('day')['pnl_rs'].sum()
-    for d in ['Monday','Tuesday','Wednesday','Thursday','Friday']:
-        if d in dpnl.index:
-            p=dpnl[d]; dc=len(tdf[tdf['day']==d])
-            e="🟢" if p>0 else "🔴"
-            print(f"  {e} {d:<12}: ₹{p:,.0f} ({dc} trades)")
-
-    print(f"\n📋 ALL TRADES:")
-    if mode == "ITM":
-        print(f"{'Date':<12}{'Time':<7}{'Day':<12}{'Sig':<6}{'Strike':<12}{'Entry':<10}{'RSI':<6}{'TGT':<7}{'Exit':<10}{'MaxFav':<8}{'Prem':<7}{'P&L₹':<9}Result")
-        print("-"*105)
-        icons = {'TARGET':'✅','TRAIL':'🔒','SL':'❌','BE':'⚖️','WEAK':'⚠️','EOD':'➡️'}
-        for _, r in tdf.iterrows():
-            icon = icons.get(r['outcome'],'➡️')
-            exp  = " ⚡" if r['expiry'] else ""
-            strike = r.get('strike', '-')
-            print(f"{r['date']:<12}{r['time']:<7}{r['day']:<12}{r['signal']:<6}{strike:<12}{r['entry']:<10}"
-                  f"{r['rsi']:<6}{r['tgt_pts']:<7}{r['exit']:<10}"
-                  f"+{r['max_fav']:<7}{r['premium_pts']:<7}{r['pnl_rs']:<9}"
-                  f"{icon}{r['outcome']}{exp}")
-    else:
-        print(f"{'Date':<12}{'Time':<7}{'Day':<12}{'Sig':<6}{'Entry':<10}{'RSI':<6}{'TGT':<6}{'Exit':<10}{'MaxFav':<8}{'Prem':<7}{'P&L₹':<9}Result")
-        print("-"*95)
-        icons = {'TARGET':'✅','TRAIL':'🔒','SL':'❌','BE':'⚖️','WEAK':'⚠️','EOD':'➡️'}
-        for _, r in tdf.iterrows():
-            icon = icons.get(r['outcome'],'➡️')
-            exp  = " ⚡" if r['expiry'] else ""
-            print(f"{r['date']:<12}{r['time']:<7}{r['day']:<12}{r['signal']:<6}{r['entry']:<10}"
-                  f"{r['rsi']:<6}{r['tgt_pts']:<6}{r['exit']:<10}"
-                  f"+{r['max_fav']:<7}{r['premium_pts']:<7}{r['pnl_rs']:<9}"
-                  f"{icon}{r['outcome']}{exp}")
-
-    print(f"\n{sep}")
-    print("  VERDICT")
-    print(sep)
-    if wr>=55 and net>0:   print("  ✅ PROFITABLE — morning window signals are valid")
-    elif wr>=45 and net>0: print("  ⚡ MARGINAL — signals fire but edge is thin")
-    elif net>0:            print("  ⚡ POSITIVE returns but low win rate")
-    else:                  print("  ❌ Morning window not profitable as-is — needs refinement")
-
-    if bwr > swr+15 and len(sdf)>0:
-        print(f"  💡 BUY signals better ({bwr:.0f}% vs {swr:.0f}%) — consider CE-only")
-    if mls >= 3:
-        print(f"  ⚠️  Stop after 3 consecutive losses")
-    print(sep)
-
-    # Save CSV only for the final CE-only strategy (not test modes)
-    if mode == "ATM" and ce_only:
-        out_file = 'backtest_results_morning_final.csv'
-        tdf.to_csv(out_file, index=False)
-        print(f"\n  📁 Saved → {out_file}")
-    print(sep)
-
-def print_comparison(trades_atm, trades_itm, days):
-    sep = "="*70
-    print(f"\n{sep}")
-    print(f"  ATM vs ITM — SIDE BY SIDE COMPARISON  ({days}-day period)")
-    print(sep)
-    print(f"  ATM: 4 cond, delta 0.5, 9:30 start")
-    print(f"  ITM: 7 cond, delta 0.62, 9:35 start (EMA + strong breakout + RSI)")
-    print(f"\n{'Metric':<28} {'ATM (4 cond)':<20} {'ITM (7 cond)'}")
-    print("-"*68)
-
-    def stats(trades):
-        if not trades: return (0, 0, 0, 0, 0, 0)
-        tdf = pd.DataFrame(trades)
-        total = len(tdf)
-        wins  = len(tdf[tdf['outcome'].isin(['TARGET','TRAIL'])])
-        loss  = len(tdf[tdf['outcome']=='SL'])
-        bes   = len(tdf[tdf['outcome']=='BE'])
-        net   = tdf['pnl_rs'].sum()
-        wr    = wins/total*100 if total else 0
-        return (total, wins, wr, loss, bes, net)
-
-    ta, wa, wra, la, bea, neta = stats(trades_atm)
-    ti, wi, wri, li, bei, neti = stats(trades_itm)
-
-    arrow = lambda a, b, higher_better=True: "🟢" if (b > a if higher_better else b < a) else ("🔴" if (b < a if higher_better else b > a) else "⚪")
-
-    print(f"  {'Total trades':<26} {ta:<20} {ti}  {arrow(ta, ti, False)}")
-    print(f"  {'Win rate':<26} {wra:.1f}%{'':<17} {wri:.1f}%  {arrow(wra, wri)}")
-    print(f"  {'SL count':<26} {la:<20} {li}  {arrow(la, li, False)}")
-    print(f"  {'Breakeven':<26} {bea:<20} {bei}")
-    print(f"  {'Net P&L (₹)':<26} ₹{neta:,.0f}{'':<14} ₹{neti:,.0f}  {arrow(neta, neti)}")
-
-    per_m_a = neta / (days/30); per_m_i = neti / (days/30)
-    print(f"  {'Monthly P&L estimate':<26} ₹{per_m_a:,.0f}{'':<13} ₹{per_m_i:,.0f}  {arrow(per_m_a, per_m_i)}")
-
-    print(f"\n{sep}")
-    if neti > neta and wri >= wra:
-        print("  ✅ ITM strategy is BETTER — higher profit AND better win rate")
-        print(f"     Extra profit vs ATM: ₹{neti-neta:,.0f}  (+{((neti-neta)/abs(neta)*100) if neta!=0 else 0:.1f}%)")
-    elif neti > neta:
-        print("  ✅ ITM strategy has HIGHER PROFIT (fewer but better trades)")
-        print(f"     Extra profit vs ATM: ₹{neti-neta:,.0f}")
-    elif wri > wra:
-        print("  ⚡ ITM strategy has BETTER WIN RATE (tighter, but same/less profit)")
-    elif ti < ta and neti >= neta * 0.8:
-        print("  ⚡ ITM strategy trades LESS but holds P&L — good for quality focus")
-    else:
-        print("  ❌ ITM strategy did not improve results — ATM is still better")
-    print(sep)
+    summary = dict(
+        total=total, wins=wins, tgt=tgt, trail=trail, be=be, weak=weak, sl=sl,
+        wr=wr, net=net, ce_trades=len(ce_df), pe_trades=len(pe_df),
+        ce_wr=ce_wr, pe_wr=pe_wr, pe_only=pe_only,
+        period_start=str(tdf.iloc[0]['date']), period_end=str(tdf.iloc[-1]['date']),
+        tuesdays_traded=len(set(tdf['date'])),
+    )
+    return tdf.to_dict('records'), summary
 
 
 # ─── MAIN ───
 def main():
-    sep  = "="*84
+    sep = "="*72
     print(sep)
-    print("  NIFTY MORNING BACKTEST — SL Cap Test  (60 day)")
-    print("  Question: should we cap SL distance? structural SL avg=46pt, max=110pt")
-    print("  Window   : 9:30-13:00 | CE-only | Skip Tuesday | Candle SL | Target 25pt")
+    print("  NIFTY MORNING BACKTEST — Live Strategy (90 day)")
+    print("  CE-only ATM | 4 conditions | 9:30-13:00 | Skip Tuesday")
     print(sep)
 
     if not login(): return
 
-    DAYS = 60
+    DAYS     = 90
     LIVE_WIN = [(dtime(9, 30), dtime(13, 0))]
 
     print(f"Fetching {DAYS} days of Nifty 5-min data...")
@@ -744,111 +508,304 @@ def main():
         print("Failed to fetch data"); return
     print(f"  {len(df5)} candles | {df5.index[0].date()} to {df5.index[-1].date()}\n")
 
-    def qv(trades):
-        if not trades: return (0, 0.0, 0, 0, 0, 0.0, 0.0)
-        tdf = pd.DataFrame(trades)
-        total = len(tdf)
-        wins  = len(tdf[tdf['outcome'].isin(['TARGET','TRAIL'])])
-        sls   = len(tdf[tdf['outcome']=='SL'])
-        bes   = len(tdf[tdf['outcome']=='BE'])
-        net   = tdf['pnl_rs'].sum()
-        avg_sl= tdf['sl_pts'].mean() if 'sl_pts' in tdf.columns else 0
-        return (total, wins/total*100 if total else 0, sls, bes, net, net/(DAYS/30), avg_sl)
+    # ── Main strategy (Mon/Wed/Thu/Fri) ──────────────────────────────────
+    MAX_CANDLE_SL_PTS = 50   # must match nifty_morning_scanner.py
+    BASE_PARAMS = dict(days=DAYS, ce_only=True, candle_sl=True,
+                       target_pts=25, entry_windows=LIVE_WIN, skip_expiry=True,
+                       sideways_range_pt=30, max_sl_pts=MAX_CANDLE_SL_PTS,
+                       signal_candle_sl=True)
 
-    BASE_PARAMS = dict(days=DAYS, mode="ATM", ce_only=True, candle_sl=True,
-                       target_pts=25, entry_windows=LIVE_WIN, skip_expiry=True)
+    trades = run_backtest(df5, **BASE_PARAMS)
+    if not trades:
+        print("No signals found."); return
 
-    caps = [
-        ("No cap (current)",   None),
-        ("Cap 40pt",           40),
-        ("Cap 30pt",           30),
-        ("Cap 25pt",           25),
+    tdf   = pd.DataFrame(trades)
+    total = len(tdf)
+    tgt   = len(tdf[tdf['outcome']=='TARGET'])
+    trail = len(tdf[tdf['outcome']=='TRAIL'])
+    be    = len(tdf[tdf['outcome']=='BE'])
+    weak  = len(tdf[tdf['outcome']=='WEAK'])
+    sl    = len(tdf[tdf['outcome']=='SL'])
+    wins  = tgt + trail
+    wr    = wins / total * 100
+    net   = tdf['pnl_rs'].sum()
+
+    print(sep)
+    print(f"  Period  : {tdf.iloc[0]['date']} to {tdf.iloc[-1]['date']}")
+    print(f"  Trades  : {total}")
+    print(f"  Win Rate: {wr:.1f}%  (TARGET={tgt}  TRAIL={trail}  BE={be}  WEAK={weak}  SL={sl})")
+    print(f"  Net PnL : Rs{net:,.0f}  (1 lot of {LOT_SIZE})")
+    print(sep)
+    print(f"\n  {'Date':<12} {'Day':<10} {'Signal':<8} {'Entry':>8} {'Outcome':<8} {'PnL':>8} {'MaxFav':>8}")
+    print(f"  {'-'*68}")
+    for _, r in tdf.iterrows():
+        print(f"  {str(r['date']):<12} {str(r.get('day','')):<10} {r.get('signal',''):<8} "
+              f"{r['entry']:>8.1f} {r['outcome']:<8} Rs{r['pnl_rs']:>6.0f} {r['max_fav']:>7.1f}pt")
+    print(sep)
+
+    # ── SL-cap impact comparison ──────────────────────────────────────────
+    print()
+    print(sep)
+    print(f"  SL-CAP ANALYSIS — with vs without {MAX_CANDLE_SL_PTS}pt cap")
+    print(sep)
+    trades_nocap = run_backtest(df5, **{**BASE_PARAMS, 'max_sl_pts': None})
+    if trades_nocap:
+        nc = pd.DataFrame(trades_nocap)
+        nc_total = len(nc)
+        nc_wins  = len(nc[nc['outcome'].isin(['TARGET','TRAIL'])])
+        nc_wr    = nc_wins / nc_total * 100
+        nc_sl_pts = nc['sl_pts'].tolist() if 'sl_pts' in nc.columns else []
+        nc_max_sl = max(nc_sl_pts) if nc_sl_pts else 0
+        nc_avg_sl = sum(nc_sl_pts)/len(nc_sl_pts) if nc_sl_pts else 0
+        c_total  = len(tdf)
+        c_wins   = tgt + trail
+        c_wr     = wr
+        c_sl_pts = tdf['sl_pts'].tolist() if 'sl_pts' in tdf.columns else []
+        c_max_sl = max(c_sl_pts) if c_sl_pts else 0
+        c_avg_sl = sum(c_sl_pts)/len(c_sl_pts) if c_sl_pts else 0
+        filtered = nc_total - c_total
+        print(f"  {'':30} {'No cap':>12} {'Cap={:}pt'.format(MAX_CANDLE_SL_PTS):>12}  {'Impact'}")
+        print(f"  {'Trades':30} {nc_total:>12} {c_total:>12}")
+        print(f"  {'Filtered out by cap':30} {'':>12} {filtered:>12}")
+        print(f"  {'Win Rate':30} {nc_wr:>11.1f}% {c_wr:>11.1f}%")
+        print(f"  {'Max SL distance (pts)':30} {nc_max_sl:>12.1f} {c_max_sl:>12.1f}")
+        print(f"  {'Avg SL distance (pts)':30} {nc_avg_sl:>12.1f} {c_avg_sl:>12.1f}")
+        max_loss_nocap = round(nc_max_sl * 0.5 * LOT_SIZE, 0)
+        max_loss_cap   = round(c_max_sl  * 0.5 * LOT_SIZE, 0)
+        print(f"  {'Max Rs loss/lot at SL':30} Rs{max_loss_nocap:>10,.0f} Rs{max_loss_cap:>10,.0f}")
+        if filtered > 0:
+            print(f"\n  Filtered signals (SL > {MAX_CANDLE_SL_PTS}pt):")
+            filtered_df = nc[~nc.index.isin(tdf.index)] if len(nc) != len(tdf) else pd.DataFrame()
+            # Compare by date+entry to find skipped rows
+            nc_keys = set(zip(nc['date'].astype(str), nc['entry'].round(1)))
+            c_keys  = set(zip(tdf['date'].astype(str), tdf['entry'].round(1)))
+            skip_keys = nc_keys - c_keys
+            skip_rows = nc[nc.apply(lambda r: (str(r['date']), round(r['entry'],1)) in skip_keys, axis=1)]
+            for _, r in skip_rows.iterrows():
+                sl_d = r.get('sl_pts', 0)
+                print(f"    {str(r['date']):<12} {str(r.get('day','')):<10} "
+                      f"entry={r['entry']:.1f}  SL-dist={sl_d:.1f}pt  outcome={r['outcome']}  "
+                      f"PnL=Rs{r['pnl_rs']:.0f}")
+    print(sep)
+
+    # ── Tuesday MORNING strategy (9:30-10:30) ────────────────────────────
+    print()
+    print(sep)
+    print("  TUESDAY MORNING WINDOW — PE only | 9:30-10:30 | 25pt target")
+    print(sep)
+    m_trades, m_sum = run_tuesday_backtest(df5, days=DAYS, window="morning")
+    if not m_trades:
+        print("  No Tuesday morning PE signals found.")
+    else:
+        ms = m_sum
+        print(f"  Period  : {ms['period_start']} to {ms['period_end']}")
+        print(f"  Trades  : {ms['total']}")
+        print(f"  Win Rate: {ms['wr']:.1f}%  (TARGET={ms['tgt']}  TRAIL={ms['trail']}  BE={ms['be']}  WEAK={ms['weak']}  SL={ms['sl']})")
+        print(f"  Net PnL : Rs{ms['net']:,.0f}  (1 lot of {LOT_SIZE})")
+        print(sep)
+        print(f"\n  {'Date':<12} {'Time':<6} {'Entry':>8} {'Outcome':<8} {'PnL':>8} {'MaxFav':>8}")
+        print(f"  {'-'*58}")
+        for r in m_trades:
+            print(f"  {str(r['date']):<12} {str(r.get('time','')):<6} "
+                  f"{r['entry']:>8.1f} {r['outcome']:<8} Rs{r['pnl_rs']:>6.0f} {r['max_fav']:>7.1f}pt")
+        print(sep)
+
+    # ── Tuesday EVENING strategy (13:00-14:30) ───────────────────────────
+    print()
+    print(sep)
+    print("  TUESDAY EVENING WINDOW — PE only | 13:00-14:30 | 20pt target")
+    print("  (Expiry day max theta decay — selling pressure window)")
+    print(sep)
+    e_trades, e_sum = run_tuesday_backtest(df5, days=DAYS, window="evening")
+    if not e_trades:
+        print("  No Tuesday evening PE signals found.")
+    else:
+        es = e_sum
+        print(f"  Period  : {es['period_start']} to {es['period_end']}")
+        print(f"  Trades  : {es['total']}")
+        print(f"  Win Rate: {es['wr']:.1f}%  (TARGET={es['tgt']}  TRAIL={es['trail']}  BE={es['be']}  WEAK={es['weak']}  SL={es['sl']})")
+        print(f"  Net PnL : Rs{es['net']:,.0f}  (1 lot of {LOT_SIZE})")
+        print(sep)
+        print(f"\n  {'Date':<12} {'Time':<6} {'Entry':>8} {'Outcome':<8} {'PnL':>8} {'MaxFav':>8}")
+        print(f"  {'-'*58}")
+        for r in e_trades:
+            print(f"  {str(r['date']):<12} {str(r.get('time','')):<6} "
+                  f"{r['entry']:>8.1f} {r['outcome']:<8} Rs{r['pnl_rs']:>6.0f} {r['max_fav']:>7.1f}pt")
+        print(sep)
+
+    # ── Tuesday COMBINED (both windows) ──────────────────────────────────
+    all_tue = m_trades + e_trades
+    if all_tue:
+        at_total = len(all_tue)
+        at_wins  = sum(1 for t in all_tue if t['outcome'] in ('TARGET','TRAIL'))
+        at_wr    = at_wins / at_total * 100
+        at_net   = sum(t['pnl_rs'] for t in all_tue)
+        at_sl    = sum(1 for t in all_tue if t['outcome'] == 'SL')
+        print()
+        print(sep)
+        print("  TUESDAY COMBINED (both windows)")
+        print(sep)
+        print(f"  Morning  : {len(m_trades)} trades | {m_sum.get('wr',0):.1f}% WR | Rs{m_sum.get('net',0):,.0f}")
+        print(f"  Evening  : {len(e_trades)} trades | {e_sum.get('wr',0):.1f}% WR | Rs{e_sum.get('net',0):,.0f}")
+        print(f"  Combined : {at_total} trades | {at_wr:.1f}% WR | SL:{at_sl} | Rs{at_net:,.0f}")
+        print(sep)
+    else:
+        at_total = at_wins = at_net = at_sl = 0; at_wr = 0
+
+    # ── Slippage impact test: +3pt entry vs baseline ──────────────────────
+    print()
+    print(sep)
+    print("  SLIPPAGE TEST — +3pt delayed entry vs perfect-fill baseline")
+    print("  (Simulates filling 3pts above breakout candle close)")
+    print(sep)
+    trades_slip = run_backtest(df5, **BASE_PARAMS, entry_slippage_pts=3)
+    if trades_slip:
+        sdf = pd.DataFrame(trades_slip)
+        s_wins = len(sdf[sdf['outcome'].isin(['TARGET','TRAIL'])])
+        s_sl   = len(sdf[sdf['outcome']=='SL'])
+        s_wr   = s_wins / len(sdf) * 100
+        s_net  = sdf['pnl_rs'].sum()
+        print(f"  Baseline : {total} trades | WR={wr:.1f}% | SL={sl} | Net=Rs{net:,.0f}")
+        print(f"  +3pt slip: {len(sdf)} trades | WR={s_wr:.1f}% | SL={s_sl} | Net=Rs{s_net:,.0f}")
+        wr_delta  = s_wr  - wr
+        net_delta = s_net - net
+        arrow = "🟢" if wr_delta >= 0 else "🔴"
+        print(f"  Delta    : WR{wr_delta:+.1f}%  {arrow}  Net{net_delta:+,.0f}")
+        print(f"  Verdict  : {'No material impact — strategy robust to 3pt slippage ✅' if abs(wr_delta) < 3 else 'Slippage hurts — execution speed matters ⚠️'}")
+    else:
+        print("  No trades returned for slippage test.")
+    print(sep)
+
+    # ── Lower Wick Filter Test ────────────────────────────────────────────
+    print()
+    print(sep)
+    print("  LOWER WICK FILTER TEST — lw <= body added to bull_clean signal candle")
+    print("  (Does adding lower-wick check improve signal quality?)")
+    print(sep)
+    import sys as _sys
+    _mod = _sys.modules[__name__]
+    _orig_ac = _mod.analyze_candle
+    def _ac_lw(o, h, l, c):
+        body = abs(c - o); tr = h - l
+        if tr == 0: return True, False, False
+        uw = h - max(o, c); lw = min(o, c) - l
+        doji = (body / tr) < 0.1
+        return doji, (not doji and c > o and uw <= body and lw <= body), (not doji and c < o and lw <= body and uw <= body)
+    _mod.analyze_candle = _ac_lw
+    trades_lw = run_backtest(df5, **BASE_PARAMS)
+    _mod.analyze_candle = _orig_ac
+    if trades_lw:
+        lw_df   = pd.DataFrame(trades_lw)
+        lw_tot  = len(lw_df)
+        lw_wins = len(lw_df[lw_df['outcome'].isin(['TARGET','TRAIL'])])
+        lw_sl   = len(lw_df[lw_df['outcome']=='SL'])
+        lw_be   = len(lw_df[lw_df['outcome']=='BE'])
+        lw_wr   = lw_wins / lw_tot * 100
+        lw_net  = lw_df['pnl_rs'].sum()
+        filtered_lw = total - lw_tot
+        wr_delta_lw  = lw_wr  - wr
+        net_delta_lw = lw_net - net
+        arrow_lw = "+" if wr_delta_lw >= 0 else "-"
+        print(f"  {'':30} {'Baseline':>12} {'LW Filter':>12}  {'Delta'}")
+        print(f"  {'Trades':30} {total:>12} {lw_tot:>12}  {-filtered_lw:+d}")
+        print(f"  {'Filtered by lw<=body':30} {'':>12} {filtered_lw:>12}")
+        print(f"  {'Win Rate':30} {wr:>11.1f}% {lw_wr:>11.1f}%  {wr_delta_lw:+.1f}%")
+        print(f"  {'SL count':30} {sl:>12} {lw_sl:>12}  {lw_sl-sl:+d}")
+        print(f"  {'BE count':30} {be:>12} {lw_be:>12}  {lw_be-be:+d}")
+        print(f"  {'Net PnL':30} Rs{net:>9,.0f} Rs{lw_net:>9,.0f}  Rs{net_delta_lw:+,.0f}")
+        verdict = "IMPROVES results — worth implementing" if (wr_delta_lw >= 0 and net_delta_lw >= 0) else \
+                  "Mixed — check filtered trades before deciding" if (wr_delta_lw >= 0 or net_delta_lw >= 0) else \
+                  "HURTS results — do NOT implement"
+        print(f"  Verdict : {verdict}")
+        if filtered_lw > 0:
+            print(f"\n  Signals filtered by lw>body:")
+            base_keys = set(zip(tdf['date'].astype(str), tdf['entry'].round(1)))
+            lw_keys   = set(zip(lw_df['date'].astype(str), lw_df['entry'].round(1)))
+            skip_keys = base_keys - lw_keys
+            skip_rows = tdf[tdf.apply(lambda r: (str(r['date']), round(r['entry'],1)) in skip_keys, axis=1)]
+            for _, r in skip_rows.iterrows():
+                print(f"    {str(r['date']):<12} {str(r.get('day','')):<10} "
+                      f"entry={r['entry']:.1f}  outcome={r['outcome']}  PnL=Rs{r['pnl_rs']:.0f}")
+    else:
+        print("  No trades returned with lw filter — filter is too aggressive.")
+    print(sep)
+
+    # ── Rejection Zone + Green Bias Filter Tests ─────────────────────────
+    def _run_filter_test(label, **extra):
+        t = run_backtest(df5, **BASE_PARAMS, **extra)
+        if not t:
+            return None
+        d  = pd.DataFrame(t)
+        tw = len(d[d['outcome'].isin(['TARGET','TRAIL'])])
+        ts_ = len(d[d['outcome']=='SL'])
+        tb  = len(d[d['outcome']=='BE'])
+        tw2 = len(d[d['outcome']=='WEAK'])
+        tw_r = tw / len(d) * 100
+        tn  = d['pnl_rs'].sum()
+        return dict(label=label, total=len(d), wr=tw_r, sl=ts_, be=tb, weak=tw2, net=tn, df=d)
+
+    print()
+    print(sep)
+    print("  REJECTION ZONE + GREEN BIAS FILTER TESTS")
+    print("  (Do cautious filters improve signal quality?)")
+    print(sep)
+
+    # Test parameters — tuned for Nifty 5-min bars
+    REJ_UW   = 10   # upper wick >= 10pt counts as a rejection
+    REJ_ZONE = 20   # entry within 20pt of rejection high → skip
+    REJ_LB   = 24   # look back 24 candles (~2 hours)
+    GB_N     = 5    # last 5 candles (25 min)
+    GB_PCT   = 0.5  # need ≥ 50% green
+
+    variants = [
+        ("Rejection zone only",   dict(rejection_uw_min=REJ_UW, rejection_zone_pt=REJ_ZONE, rejection_lookback_n=REJ_LB)),
+        ("Green bias only",       dict(green_bias_n=GB_N, green_bias_min_pct=GB_PCT)),
+        ("Rejection + Green",     dict(rejection_uw_min=REJ_UW, rejection_zone_pt=REJ_ZONE, rejection_lookback_n=REJ_LB,
+                                       green_bias_n=GB_N, green_bias_min_pct=GB_PCT)),
     ]
 
-    all_results = {}
-    for label, cap in caps:
-        print(f"  Running: {label}...")
-        all_results[label] = run_backtest(df5, **BASE_PARAMS, max_sl_pts=cap)
-
-    # ── Summary comparison ──
-    print(f"\n{sep}")
-    print(f"  SL CAP TEST — {DAYS} days | CE-only | 9:30-13:00 | Skip Tue")
-    print(f"  Structural SL (prev_low - 5pt): avg=46pt, median=39pt, max=110pt")
-    print(sep)
-    arrow = lambda a, b, hi=True: "★" if (b > a if hi else b < a) else ""
-    print(f"  {'Metric':<20} {'No cap':<16} {'Cap 40pt':<16} {'Cap 30pt':<16} {'Cap 25pt'}")
-    print(f"  {'-'*82}")
-
-    rows = {}
-    for label, cap in caps:
-        t, wr, sl, be, net, mon, _ = qv(all_results[label])
-        rows[label] = (t, wr, sl, be, net, mon)
-
-    def row4(name, fn, hi=True):
-        vals = [fn(rows[l]) for l, _ in caps]
-        best = max(vals) if hi else min(vals)
-        parts = [f"{vals[0]:<16}"]
-        for v in vals[1:]:
-            star = " ★" if v == best and v != vals[0] else ""
-            parts.append(f"{v:<14}{star}")
-        print(f"  {name:<20} {''.join(parts)}")
-
-    nc = rows["No cap (current)"]
-    print(f"  {'Trades':<20} {nc[0]:<16}", end="")
-    for label, _ in caps[1:]:
-        print(f" {rows[label][0]:<15}", end="")
-    print()
-
-    for label, cap in caps:
-        t, wr, sl, be, net, mon = rows[label]
-        star = ""
-        print(f"  {label:<20} trades={t}  win={wr:.1f}%  SLs={sl}  BEs={be}  net=₹{net:,.0f}  monthly=₹{mon:,.0f}")
-
+    header = f"  {'Filter':<28} {'Trades':>7} {'WR':>7} {'SL':>4} {'BE':>4} {'Net PnL':>10}  {'Delta WR':>9}  Verdict"
+    print(header)
+    print(f"  {'-'*90}")
+    base_row = f"  {'Baseline':<28} {total:>7} {wr:>6.1f}% {sl:>4} {be:>4} Rs{net:>8,.0f}"
+    print(base_row)
+    for vlabel, vparams in variants:
+        r = _run_filter_test(vlabel, **vparams)
+        if r is None:
+            print(f"  {vlabel:<28}  No trades — too aggressive")
+            continue
+        dwr  = r['wr']  - wr
+        dnet = r['net'] - net
+        dtrd = r['total'] - total
+        verdict = ("BETTER" if dwr >= 0 and dnet >= 0 else
+                   "MIXED"  if dwr >= 0 or  dnet >= 0 else
+                   "WORSE")
+        print(f"  {vlabel:<28} {r['total']:>7} {r['wr']:>6.1f}% {r['sl']:>4} {r['be']:>4} "
+              f"Rs{r['net']:>8,.0f}  {dwr:>+7.1f}%  {verdict}  (trades{dtrd:+d} net{dnet:+,.0f})")
+        # show which signals were filtered
+        base_keys = set(zip(tdf['date'].astype(str), tdf['entry'].round(1)))
+        var_keys  = set(zip(r['df']['date'].astype(str), r['df']['entry'].round(1)))
+        skip_keys = base_keys - var_keys
+        if skip_keys:
+            skip_rows = tdf[tdf.apply(lambda row: (str(row['date']), round(row['entry'],1)) in skip_keys, axis=1)]
+            for _, sr in skip_rows.iterrows():
+                print(f"      FILTERED: {str(sr['date']):<12} {str(sr.get('day','')):<10} "
+                      f"entry={sr['entry']:.1f}  outcome={sr['outcome']}  PnL=Rs{sr['pnl_rs']:.0f}")
     print(sep)
 
-    # ── Highlight changes from current ──
-    base_trades = all_results["No cap (current)"]
-    base_by_date = {r['date']: r for r in base_trades}
-    icons = {'TARGET':'✅','TRAIL':'🔒','SL':'❌','BE':'⚖️','WEAK':'⚠️','EOD':'➡️'}
-
-    for label, cap in caps[1:]:
-        cap_trades = all_results[label]
-        cap_by_date = {r['date']: r for r in cap_trades}
-        changed = [(d, base_by_date[d], cap_by_date[d])
-                   for d in base_by_date
-                   if d in cap_by_date and base_by_date[d]['outcome'] != cap_by_date[d]['outcome']]
-        if changed:
-            print(f"\n  Changes with {label}:")
-            for d, b, c in changed:
-                bi = icons.get(b['outcome'],'➡️'); ci = icons.get(c['outcome'],'➡️')
-                print(f"    {d}  entry={b['entry']:.1f}  sl_dist_orig={b['sl_pts']:.1f}pt  "
-                      f"{bi}{b['outcome']} ₹{b['pnl_rs']:.0f}  →  {ci}{c['outcome']} ₹{c['pnl_rs']:.0f}")
-        else:
-            print(f"\n  {label}: NO changes vs no-cap — zero new SL exits")
-
+    # ── GRAND TOTAL (main + both Tuesday windows) ─────────────────────────
     print()
     print(sep)
-    # ── Verdict ──
-    bt, bwr, bsl, bbe, bnet, bmon = rows["No cap (current)"]
-    c30t, c30wr, c30sl, c30be, c30net, c30mon = rows["Cap 30pt"]
-    c25t, c25wr, c25sl, c25be, c25net, c25mon = rows["Cap 25pt"]
-
-    print(f"  VERDICT")
+    print("  GRAND TOTAL — MAIN + TUESDAY (MORNING + EVENING)")
     print(sep)
-    if c30sl == bsl:
-        print(f"  ✅ SL cap makes NO difference to outcomes — structural SL never gets triggered")
-        print(f"     The wide SL (avg 46pt) is a theoretical backstop that has never fired.")
-        print(f"     TRAIL/BE/WEAK exits always happen first (within 5-15pt of entry).")
-        print(f"     Adding a cap is optional — adds a safety net for extreme future scenarios")
-        print(f"     without hurting current 60-day performance.")
-        print(f"     Recommendation: add 30pt cap as safety net — zero cost, pure risk protection.")
-    elif c30sl > bsl:
-        print(f"  ⚠️  30pt cap creates {c30sl-bsl} new SL exits — some trades dip 25-30pt before recovering")
-        print(f"     The structural SL is actually needed for those trades.")
-        if c25sl > c30sl:
-            print(f"     25pt cap is worse — do not use. 30pt cap might be acceptable if you want protection.")
-        else:
-            print(f"     Consider 40pt cap as compromise.")
+    grand_total = total + at_total
+    grand_wins  = wins  + at_wins
+    grand_net   = net   + at_net
+    grand_wr    = grand_wins / grand_total * 100 if grand_total else 0
+    print(f"  Trades  : {grand_total}  (Main={total}  Tue-Morn={len(m_trades)}  Tue-Eve={len(e_trades)})")
+    print(f"  Win Rate: {grand_wr:.1f}%")
+    print(f"  Net PnL : Rs{grand_net:,.0f}  (1 lot x {LOT_SIZE})")
+    print(f"  Monthly : Rs{grand_net/3:,.0f}/month")
     print(sep)
 
 if __name__ == "__main__":
