@@ -76,12 +76,13 @@ POSITION_FILE   = "morning_position_state.json"
 BOT_CONFIG_FILE = "bot_config.json"
 SIGNAL_LOG_FILE = "live_signal_log.csv"
 SIGNAL_LOG_FIELDS = [
-    "date","time","day","signal",
+    "date","time","day","window","signal",
     "entry_spot","sl_spot","sl_dist_pt","target_spot",
     "vwap","prev_candle_high","prev_candle_low","supertrend","option_ltp",
     "symbol","entry_premium","sl_premium","target_premium","mode",
     "outcome","exit_spot","exit_premium","pnl_rs","max_fav_pt","exit_time"
 ]
+# window values: "regular_ce" | "evening_pe" | "tuesday_pe"
 
 # ─── TUESDAY WINDOW — signal-only log ───
 TUESDAY_SIGNAL_LOG_FILE = "tuesday_signal_log.csv"
@@ -91,8 +92,13 @@ TUESDAY_SIGNAL_LOG_FIELDS = [
 ]
 TUESDAY_END            = dtime(10, 30)   # Morning window closes 10:30
 TUESDAY_EVENING_START  = dtime(13,  0)   # Evening window opens 13:00
-TUESDAY_EVENING_END    = dtime(14, 30)   # Evening window closes 14:30
+TUESDAY_EVENING_END    = dtime(14,  0)   # Evening window closes 14:00 (theta too fast after 2pm)
 TUESDAY_EVENING_TARGET = 20              # 20pt target for evening (backtest: 100% WR)
+
+# ─── EVENING PE WINDOW (Mon/Wed/Thu/Fri only, signal-only, no auto-execution) ───
+EVENING_PE_START  = dtime(13, 0)   # opens when morning CE window closes
+EVENING_PE_END    = dtime(14, 0)   # closes at 2 PM
+EVENING_PE_TARGET = 20             # 20pt target (backtest: 72.7% WR, Rs5,565 / 90d)
 
 # ─── BOT CONFIG (persisted to bot_config.json — survives restarts) ───
 def _load_bot_config():
@@ -117,12 +123,14 @@ AUTO_ARMED         = False
 ACTIVE_LOTS        = 1     # set by /start_auto N; qty = ACTIVE_LOTS * LOT_SIZE
 _alert_stop_event  = threading.Event()   # set via /stop_alerts to stop signal broadcast loop
 _alerts_active     = False               # True while the 30s broadcast loop is running
-position     = None  # dict of open position or None
+position        = None  # dict of open position or None
+paper_positions = {}   # window -> virtual position dict (tracks outcome for signal-only signals)
 
 daily_pnl_rs       = 0.0   # running P&L today — resets each new day
 eod_report_sent    = False  # True after 3:30 PM report sent today
 premarket_sent     = False  # True after 9:25 AM pre-market alert sent today
 spike_disarmed_today = False  # True after spike auto-disarmed at 2:40 PM today
+live_trade_done_today = False  # True once a LIVE position closes — blocks second execution same day
 
 SPIKE_ARMED     = False  # separate from AUTO_ARMED — monitors intracandle momentum
 SPIKE_THRESHOLD = int(os.getenv("SPIKE_THRESHOLD", "50"))  # pts move within a 5-min candle
@@ -360,7 +368,7 @@ def run_remote_backtest(days, trail_enabled=True, bt_lots=1):
 
 
 def run_remote_tuesday_backtest(days, bt_lots=1):
-    """Tuesday backtest — both morning (9:30-10:30) and evening (13:00-14:30) windows."""
+    """Tuesday backtest — both morning (9:30-10:30) and evening (13:00-14:00) windows."""
     global backtest_running
     try:
         import nifty_morning_backtest as mbt
@@ -404,9 +412,9 @@ def run_remote_tuesday_backtest(days, bt_lots=1):
                      f"{ms['total']} trades | {ms['wr']:.0f}% WR | SL:{ms['sl']} | Rs{ms['net']:,.0f}\n"
                      f"<code>{m_block}</code>") if m_trades else "🌅 <b>Morning 09:30-10:30</b>: No signals"
 
-        e_section = (f"🌆 <b>Evening 13:00-14:30 | 20pt</b>\n"
+        e_section = (f"🌆 <b>Evening 13:00-14:00 | 20pt</b>\n"
                      f"{es['total']} trades | {es['wr']:.0f}% WR | SL:{es['sl']} | Rs{es['net']:,.0f}\n"
-                     f"<code>{e_block}</code>") if e_trades else "🌆 <b>Evening 13:00-14:30</b>: No signals"
+                     f"<code>{e_block}</code>") if e_trades else "🌆 <b>Evening 13:00-14:00</b>: No signals"
 
         verdict = "✅ BOTH PROFITABLE" if (m_trades and ms['wr'] >= 65 and e_trades and es['wr'] >= 65) \
                   else ("✅ PROFITABLE" if at_net > 0 and at_wr >= 65 else ("⚡ MARGINAL" if at_net > 0 else "❌"))
@@ -797,7 +805,7 @@ def analyze_candle(o,h,l,c):
     if tr==0: return True, False, False
     uw=h-max(o,c); lw=min(o,c)-l
     doji=(body/tr)<0.1
-    return doji, (not doji and c>o and uw<=body), (not doji and c<o and lw<=body)
+    return doji, (not doji and c>o and uw<=body and lw<=body), (not doji and c<o and lw<=body)
 
 def get_strike(price, signal):
     """ATM strike — backtest confirmed ATM outperforms ITM in morning window"""
@@ -964,7 +972,7 @@ def check_gtt_triggered():
         if our_gtt is None:
             return  # GTT not visible yet - don't clear (we cancel it ourselves on exit)
         if our_gtt['status'] == 'triggered':
-            global daily_pnl_rs
+            global daily_pnl_rs, live_trade_done_today
             max_fav       = position.get("peak_favorable", 0)
             qty           = position.get("qty", LOT_SIZE)
             entry_premium = position.get("entry_premium", 0)
@@ -1007,6 +1015,7 @@ def check_gtt_triggered():
             )
             log_live_exit(gtt_leg, exit_spot=0, pnl_rs=gtt_pnl, max_fav_pt=max_fav)
             position = None
+            live_trade_done_today = True  # block further live execution today
             save_position_state()
     except Exception as e:
         print(f"GTT status check error: {e}")
@@ -1043,6 +1052,27 @@ def get_live_stats():
     dates = sorted(r["date"] for r in closed if r.get("date"))
     return dict(total=total, wins=wins, sl=sl, wr=wr, net=net,
                 first=dates[0] if dates else "", last=dates[-1] if dates else "")
+
+def get_window_stats(today_only=False):
+    """Return signal counts and P&L breakdown per window from live_signal_log.csv."""
+    rows = _load_signal_log() if os.path.exists(SIGNAL_LOG_FILE) else []
+    if today_only:
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        rows = [r for r in rows if r.get("date","") == today_str]
+    WIN_OUTCOMES = ("TARGET", "TRAIL", "GTT")
+    result = {}
+    for r in rows:
+        w = r.get("window","") or "regular_ce"
+        if w not in result:
+            result[w] = {"signals": 0, "closed": 0, "wins": 0, "sl": 0, "net": 0.0}
+        result[w]["signals"] += 1
+        oc = r.get("outcome","")
+        if oc not in ("", "SIGNAL", "OPEN"):
+            result[w]["closed"] += 1
+            if oc in WIN_OUTCOMES:   result[w]["wins"] += 1
+            elif oc == "SL":         result[w]["sl"]   += 1
+            result[w]["net"] += float(r.get("pnl_rs") or 0)
+    return result
 
 def get_tuesday_stats():
     """Read tuesday_signal_log.csv and return actual Tuesday PE performance."""
@@ -1083,23 +1113,32 @@ def _save_signal_log(rows):
     except Exception as e:
         print(f"  [log] Save error: {e}")
 
-def log_live_signal(signal, price, prev_low, symbol="", entry_premium=0,
-                    sl_premium=0, target_premium=0, mode="SIGNAL", info=None, option_ltp=None):
+def log_live_signal(signal, price, sl_ref, symbol="", entry_premium=0,
+                    sl_premium=0, target_premium=0, mode="SIGNAL", info=None,
+                    option_ltp=None, window="regular_ce"):
     now = datetime.now()
-    sl_spot = round(prev_low - CANDLE_SL_BUFFER, 2)
+    # Use correct target pts per window
+    _tgt = (TUESDAY_EVENING_TARGET if window in ("tuesday_pe", "evening_pe") else TARGET_PTS)
+    if signal == "SELL":
+        sl_spot     = round(sl_ref + CANDLE_SL_BUFFER, 2)  # SL above entry for PE
+        target_spot = round(price - _tgt, 2)
+    else:
+        sl_spot     = round(sl_ref - CANDLE_SL_BUFFER, 2)  # SL below entry for CE
+        target_spot = round(price + _tgt, 2)
     vwap_val      = round(info["vwap"], 2)     if info and "vwap"      in info else ""
     prev_high_val = round(info["prev_high"], 2) if info and "prev_high" in info else ""
-    prev_low_val  = round(info["prev_low"],  2) if info and "prev_low"  in info else round(prev_low, 2)
+    prev_low_val  = round(info["prev_low"],  2) if info and "prev_low"  in info else round(sl_ref, 2)
     st_val        = "UP" if (info and info.get("st")) else "DOWN" if info else ""
     row = {
         "date":             now.strftime("%Y-%m-%d"),
         "time":             now.strftime("%H:%M"),
         "day":              now.strftime("%A"),
+        "window":           window,
         "signal":           signal,
         "entry_spot":       round(price, 2),
         "sl_spot":          sl_spot,
-        "sl_dist_pt":       round(price - sl_spot, 1),
-        "target_spot":      round(price + TARGET_PTS, 2),
+        "sl_dist_pt":       round(abs(price - sl_spot), 1),
+        "target_spot":      target_spot,
         "vwap":             vwap_val,
         "prev_candle_high": prev_high_val,
         "prev_candle_low":  prev_low_val,
@@ -1120,7 +1159,11 @@ def log_live_signal(signal, price, prev_low, symbol="", entry_premium=0,
     rows = _load_signal_log()
     rows.append(row)
     _save_signal_log(rows)
-    print(f"  [log] Signal logged: {signal} @ {price:.2f} ({mode})")
+    print(f"  [log] Signal logged: {signal} @ {price:.2f} ({mode}) [{window}]")
+    # Open a virtual paper position to auto-track outcome (target/SL/EOD) in the CSV
+    # Skip regular_ce when AUTO_ARMED — real position monitor will handle it instead
+    if mode == "SIGNAL" and not (AUTO_ARMED and window == "regular_ce"):
+        _open_paper_position(signal, round(price, 2), sl_spot, target_spot, _tgt, window, now)
 
 def update_log_last_open(**kwargs):
     """Promote the most recent SIGNAL row to OPEN — called after order actually fills."""
@@ -1145,6 +1188,92 @@ def log_live_exit(outcome, exit_spot=0, exit_premium=0, pnl_rs=0, max_fav_pt=0):
             break
     _save_signal_log(rows)
     print(f"  [log] Exit logged: {outcome}")
+
+# ─── PAPER POSITION TRACKER (virtual outcome for signal-only signals) ────────
+def _open_paper_position(signal, entry_spot, sl_spot, target_spot, target_pts, window, open_time):
+    """Register a virtual position to track outcome even when no real order is placed."""
+    paper_positions[window] = {
+        "signal":       signal,
+        "entry_spot":   entry_spot,
+        "sl_spot":      sl_spot,       # updated to breakeven when BE triggers
+        "sl_original":  sl_spot,       # fixed: used for SL loss calculation
+        "target_spot":  target_spot,
+        "target_pts":   target_pts,
+        "date_str":     open_time.strftime("%Y-%m-%d"),
+        "time_str":     open_time.strftime("%H:%M"),
+        "peak_fav":     0.0,
+        "be_hit":       False,
+    }
+    print(f"  [paper] {window} paper position opened: {signal} @ {entry_spot:.2f} | tgt={target_spot:.2f} | sl={sl_spot:.2f}")
+
+def _close_paper_position(window, outcome, exit_spot):
+    """Close a paper position and write outcome + P&L back to live_signal_log.csv."""
+    pp = paper_positions.pop(window, None)
+    if pp is None: return
+    sig     = pp["signal"]
+    entry   = pp["entry_spot"]
+    tgt_p   = pp["target_pts"]
+    sl_orig = pp["sl_original"]
+    if outcome == "TARGET":
+        pnl_pts = tgt_p
+    elif outcome == "SL":
+        pnl_pts = -(abs(entry - sl_orig))
+    elif outcome == "BE":
+        pnl_pts = 0.0
+    else:  # EOD or WEAK — actual move at close
+        pnl_pts = (exit_spot - entry) if sig == "BUY" else (entry - exit_spot)
+    pnl_rs = round(pnl_pts * OPTION_DELTA * LOT_SIZE, 0)
+    # Update the matching signal row in live_signal_log.csv
+    rows = _load_signal_log()
+    for r in reversed(rows):
+        if (r.get("date")   == pp["date_str"] and
+            r.get("window") == window and
+            r.get("signal") == sig and
+            r.get("time")   == pp["time_str"] and
+            r.get("outcome") in ("SIGNAL", "OPEN", "")):
+            r["outcome"]   = outcome
+            r["exit_spot"] = round(float(exit_spot), 2)
+            r["pnl_rs"]    = pnl_rs
+            r["exit_time"] = datetime.now().strftime("%H:%M")
+            break
+    _save_signal_log(rows)
+    print(f"  [paper] {window} closed: {outcome} | pnl_pts={pnl_pts:.1f} | Rs{pnl_rs:+.0f}")
+
+def monitor_paper_positions(current_spot):
+    """Check virtual exit conditions for all open paper positions — call every price poll."""
+    to_close = []
+    for window, pp in list(paper_positions.items()):
+        sig = pp["signal"]
+        entry = pp["entry_spot"]
+        tgt   = pp["target_spot"]
+        if sig == "BUY":
+            spot_move = current_spot - entry
+            hit_tgt   = current_spot >= tgt
+        else:
+            spot_move = entry - current_spot
+            hit_tgt   = current_spot <= tgt
+        pp["peak_fav"] = max(pp["peak_fav"], spot_move)
+        # BE: when 50% of target reached, move SL to entry price
+        if not pp["be_hit"] and pp["peak_fav"] >= pp["target_pts"] * 0.5:
+            pp["be_hit"]   = True
+            pp["sl_spot"]  = entry
+            print(f"  [paper] {window} BE activated @ {current_spot:.2f} (moved SL to {entry:.2f})")
+        # Check SL hit (may now be at breakeven)
+        if sig == "BUY":
+            hit_sl = current_spot <= pp["sl_spot"]
+        else:
+            hit_sl = current_spot >= pp["sl_spot"]
+        if hit_tgt:
+            to_close.append((window, "TARGET", current_spot))
+        elif hit_sl:
+            to_close.append((window, "BE" if pp["be_hit"] else "SL", current_spot))
+    for window, outcome, exit_spot in to_close:
+        _close_paper_position(window, outcome, exit_spot)
+
+def close_all_paper_positions_eod(current_spot):
+    """Close all still-open paper positions at EOD."""
+    for window in list(paper_positions.keys()):
+        _close_paper_position(window, "EOD", current_spot)
 
 # ─── TUESDAY SIGNAL LOG ──────────────────────────────────────────────────────
 def _load_tuesday_log():
@@ -1263,7 +1392,12 @@ def check_tuesday_signals(df5):
                                     "prev_low": pl, "prev_high": ph,
                                     "curr_low": l, "curr_high": h}
 
-    # 4 conditions — bearish side (mirrors CE conditions exactly)
+    # ── PE B1: prev candle lower wick must not show buyer support at breakdown level ──
+    _prev_body = abs(float(prev['Close']) - float(prev['Open']))
+    _prev_lw   = min(float(prev['Open']), float(prev['Close'])) - float(prev['Low'])
+    pe_b1_ok   = not (_prev_body > 0 and _prev_lw > _prev_body)
+
+    # 4 conditions — bearish side (mirrors CE conditions exactly) + B1
     cond_vwap  = price < vwap
     cond_st    = st == False
     cond_brk   = price < pl          # breakdown below prev candle low
@@ -1278,7 +1412,7 @@ def check_tuesday_signals(df5):
         "cond_brk_bear":  cond_brk,
     }
 
-    if all([cond_vwap, cond_st, cond_brk, cond_clean]):
+    if all([cond_vwap, cond_st, cond_brk, cond_clean, pe_b1_ok]):
         return "SELL", price, info
     return None, price, info
 
@@ -1325,7 +1459,7 @@ def format_tuesday_evening_alert(price, info, alert_num, option_ltp=None):
 
     return f"""📉 <b>BUY PE 🔴 — EVENING WINDOW</b>
 
-📡 <b>TUESDAY EVENING WINDOW</b> (13:00-14:30 | Expiry Day)
+📡 <b>TUESDAY EVENING WINDOW</b> (13:00-14:00 | Expiry Day)
 🔵 SIGNAL ONLY — place order manually on Kite
 📅 {now_str}
 💹 BUY <b>{strike}</b>
@@ -1343,6 +1477,39 @@ def format_tuesday_evening_alert(price, info, alert_num, option_ltp=None):
 
 ⚡ Expiry Day — MAXIMUM theta decay in final 2 hours
 ⚠️ <i>SIGNAL ONLY — no auto-execution on Tuesday</i>""".strip()
+
+
+def format_evening_pe_alert(price, info, alert_num, option_ltp=None):
+    now_str   = datetime.now().strftime("%d %b %Y %I:%M %p")
+    prev_high = info.get("prev_high", price * 1.002) if info else price * 1.002
+    sl_level  = round(prev_high + CANDLE_SL_BUFFER, 2)
+    sl_pts    = round(sl_level - price, 1)
+    tgt       = round(price - EVENING_PE_TARGET, 2)
+    strike    = get_strike(price, "SELL")
+    ltp_line  = f"💰 Option LTP: <b>₹{option_ltp}</b> (buy around this price)\n" if option_ltp else ""
+    rr        = round(EVENING_PE_TARGET / sl_pts, 1) if sl_pts else "?"
+    day_name  = datetime.now().strftime("%A")
+
+    return f"""📉 <b>PE SIGNAL — EVENING WINDOW 🌆</b>
+
+📡 <b>EVENING WINDOW</b> ({EVENING_PE_START.strftime('%H:%M')}–{EVENING_PE_END.strftime('%H:%M')})
+🔵 SIGNAL ONLY — place order manually on Kite
+📅 {now_str} ({day_name})
+💹 BUY <b>{strike}</b>
+📊 Nifty: <b>{price:.2f}</b>
+{ltp_line}🛑 SL: <b>{sl_level}</b>  (prev high {prev_high:.1f} + {CANDLE_SL_BUFFER}pt = <b>{sl_pts:.0f}pt risk</b>)
+🎯 Target: <b>{tgt}</b>  (−{EVENING_PE_TARGET}pt)
+📐 R:R = 1 : {rr}
+🔢 Signal #{alert_num}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+<b>All 4 conditions confirmed ✅</b>
+  ✅ Price below VWAP
+  ✅ Supertrend bearish
+  ✅ Breakdown below prev candle low
+  ✅ Bear clean candle (no wick trap)
+
+⚠️ <i>SIGNAL ONLY — no auto-execution in evening window</i>""".strip()
 
 
 def load_position_state():
@@ -1646,7 +1813,7 @@ def execute_manual_entry(opt_type):
     sl_spot        = (price - sl_spot_dist) if opt_type == "CE" else (price + sl_spot_dist)
 
     gtt_id = place_gtt_oco(symbol, qty, sl_premium, target_premium, avg_price)
-    log_live_signal(signal, price, prev_low, option_ltp=ltp)
+    log_live_signal(signal, price, prev_low, option_ltp=ltp, window="regular_ce")
     update_log_last_open(symbol=symbol, entry_premium=avg_price,
                          sl_premium=sl_premium, target_premium=target_premium, mode="MANUAL")
 
@@ -1754,7 +1921,7 @@ def monitor_position(current_spot, option_ltp=None):
 
 def exit_position(reason, exit_spot=0):
     """Cancel GTT + limit exit. Retries once on failure. Position only cleared if order succeeds."""
-    global position, daily_pnl_rs
+    global position, daily_pnl_rs, live_trade_done_today
     if position is None: return
     max_fav    = position.get("peak_favorable", 0)
     entry_spot = position.get("entry_spot", 0)
@@ -1788,6 +1955,7 @@ def exit_position(reason, exit_spot=0):
     )
     log_live_exit(reason, exit_spot=exit_spot, pnl_rs=pnl_rs, max_fav_pt=max_fav)
     position = None
+    live_trade_done_today = True  # block any further live execution today
     save_position_state()
 
 # ─── SIGNAL ENGINE — CE-only ATM, 4 conditions ───
@@ -1842,12 +2010,16 @@ def check_signals_relaxed(df5):
                                    "cond_vwap_bull": price > vwap, "cond_st_bull": st,
                                    "cond_brk_bull": price > ph}, None
 
-    # 4 conditions — VWAP + Supertrend + Breakout + Bull clean candle
+    # ── B1 filter: prev candle upper wick — CE only ──
+    prev_body = abs(float(prev['Close']) - float(prev['Open']))
+    prev_uw   = float(prev['High']) - max(float(prev['Open']), float(prev['Close']))
+    ce_b1_ok  = not (prev_body > 0 and prev_uw > prev_body)
+
+    # ── CE conditions — VWAP + Supertrend + Breakout + Bull clean + B1 ──
     cond_vwap  = price > vwap
     cond_st    = st == True
     cond_brk   = price > ph
-    cond_clean = bull_clean
-    buy_ok = all([cond_vwap, cond_st, cond_brk, cond_clean])
+    buy_ok  = all([cond_vwap, cond_st, cond_brk, bull_clean, ce_b1_ok])
 
     info = {
         "vwap": vwap, "st": st,
@@ -1943,48 +2115,114 @@ def format_alert(signal, price, info, alert_num, option_ltp=None):
     return msg.strip()
 
 
+def format_pe_alert(price, info, pe_count, option_ltp=None, ce_open=False):
+    now_str   = datetime.now().strftime("%d %b %Y %I:%M %p")
+    strike    = get_strike(price, "SELL")
+    curr_high = info.get("curr_high", price * 1.002) if info else price * 1.002
+    sl_level  = round(curr_high + CANDLE_SL_BUFFER, 2)
+    sl_pts    = round(sl_level - price, 1)
+    tgt       = round(price - TARGET_PTS, 2)
+    vwap      = info.get("vwap", 0) if info else 0
+    rr        = round(TARGET_PTS / sl_pts, 1) if sl_pts else "?"
+    ltp_line  = f"💰 Option LTP: <b>₹{option_ltp}</b> (buy around this price)\n" if option_ltp else ""
+    ce_note   = "\n⚠️ <i>CE position currently open — track PE manually</i>" if ce_open else ""
+    msg = f"""📉 <b>PE SIGNAL — SELL NOW 🔴</b>
+
+📡 <b>MORNING WINDOW</b> ({MORNING_START.strftime('%H:%M')}–{MORNING_END.strftime('%H:%M')})
+⚠️ SIGNAL ONLY — for tracking/analysis (no auto-execution)
+📅 {now_str}
+💹 BUY <b>{strike}</b>
+📊 Nifty: <b>{price:.2f}</b>   VWAP: {vwap:.1f}
+{ltp_line}🛑 SL: <b>{sl_level}</b>  (candle high {curr_high:.1f} + {CANDLE_SL_BUFFER}pt = <b>{sl_pts:.0f}pt risk</b>)
+🎯 Target: <b>{tgt}</b>  (−{TARGET_PTS}pt)
+📐 R:R = 1 : {rr}
+🔢 PE Signal #{pe_count}
+{ce_note}
+━━━━━━━━━━━━━━━━━━━━━━━━
+💎 <b>All 4 conditions confirmed ✅</b>
+  ✅ Price below VWAP
+  ✅ Supertrend bearish
+  ✅ Breakdown below prev candle low
+  ✅ Bear clean candle (tight wick)
+
+📅 {get_expiry_label()}"""
+    return msg.strip()
+
 
 # ─── EOD REPORT ─────────────────────────────────────────────────────────────
 def send_eod_report():
     rows = _load_signal_log()
-    today_str = datetime.now().strftime('%Y-%m-%d')
+    today_str  = datetime.now().strftime('%Y-%m-%d')
     today_rows = [r for r in rows if r.get('date','') == today_str]
-    closed = [r for r in today_rows if r.get('outcome','') not in ('', 'SIGNAL', 'OPEN')]
     date_label = datetime.now().strftime('%d %b')
 
     if not today_rows:
         send_telegram(f"📊 <b>EOD Report — {date_label}</b>\n\nNo signals today. 😴")
         return
 
-    WIN_OUTCOMES = ('TARGET', 'TRAIL', 'GTT')
-    wins      = [r for r in closed if r.get('outcome','') in WIN_OUTCOMES]
-    losses    = [r for r in closed if r.get('outcome','') == 'SL']
-    total_pnl = sum(float(r.get('pnl_rs') or 0) for r in closed)
+    WIN_OUTCOMES   = ('TARGET', 'TRAIL', 'GTT')
+    OPEN_OUTCOMES  = ('', 'SIGNAL', 'OPEN')
+    OUTCOME_ICONS  = {'TARGET': '🎯', 'TRAIL': '🏃', 'BE': '⚖️', 'WEAK': '😴', 'SL': '❌', 'EOD': '⏰', 'GTT': '🎯'}
+    WINDOW_LABELS  = {
+        'regular_ce': '📈 Regular CE  (9:30-13:00)',
+        'tuesday_pe': '📉 Tuesday PE  (13:00-14:00)',
+        'evening_pe': '🌆 Evening PE  (13:00-14:00)',
+    }
+
+    def _window_block(win_key, win_rows):
+        closed = [r for r in win_rows if r.get('outcome','') not in OPEN_OUTCOMES]
+        wins   = sum(1 for r in closed if r.get('outcome','') in WIN_OUTCOMES)
+        sls    = sum(1 for r in closed if r.get('outcome','') == 'SL')
+        pnl    = sum(float(r.get('pnl_rs') or 0) for r in closed)
+        label  = WINDOW_LABELS.get(win_key, win_key)
+        lines  = [f"\n<b>{label}</b>",
+                  f"  Signals: {len(win_rows)} | Closed: {len(closed)} | ✅{wins} ❌{sls} | ₹{pnl:+,.0f}"]
+        for r in closed:
+            oc      = r.get('outcome','')
+            icon    = OUTCOME_ICONS.get(oc, '•')
+            pnl_r   = float(r.get('pnl_rs') or 0)
+            lines.append(f"    {icon} {r.get('time','')}  {oc:<7}  ₹{pnl_r:+,.0f}")
+        return lines, pnl
+
+    # Group rows by window
+    window_groups = {}
+    for r in today_rows:
+        w = r.get('window','') or 'regular_ce'
+        window_groups.setdefault(w, []).append(r)
+
+    # Overall totals (across all windows)
+    all_closed = [r for r in today_rows if r.get('outcome','') not in OPEN_OUTCOMES]
+    total_pnl  = sum(float(r.get('pnl_rs') or 0) for r in all_closed)
+    total_wins  = sum(1 for r in all_closed if r.get('outcome','') in WIN_OUTCOMES)
+    total_sls   = sum(1 for r in all_closed if r.get('outcome','') == 'SL')
 
     if total_pnl > 0:
         day_icon = "🟢 <b>PROFIT DAY</b> 🎉"
     elif total_pnl < 0:
         day_icon = "🔴 <b>LOSS DAY</b>"
     else:
-        day_icon = "⚪ <b>BREAKEVEN DAY</b>"
+        day_icon = "⚪ <b>BREAKEVEN / SIGNAL ONLY</b>"
 
-    OUTCOME_ICONS = {'TARGET': '🎯', 'TRAIL': '🏃', 'BE': '⚖️', 'WEAK': '😴', 'SL': '❌', 'EOD': '⏰'}
-    msg = (f"📊 <b>EOD Report — {date_label}</b>\n"
-           f"{day_icon}\n\n"
-           f"Signals: {len(today_rows)} | Closed: {len(closed)}\n"
-           f"✅ Wins: {len(wins)}  ❌ SL: {len(losses)}\n"
-           f"💰 <b>P&L: ₹{total_pnl:+,.0f}</b>\n")
-    if closed:
-        msg += "\n<b>Trade log:</b>"
-        for r in closed:
-            oc   = r.get('outcome','')
-            icon = OUTCOME_ICONS.get(oc, '•')
-            pnl  = float(r.get('pnl_rs') or 0)
-            pnl_str = f"₹{pnl:+,.0f}"
-            msg += f"\n  {icon} {r.get('time','')}  {oc:<7}  {pnl_str}"
-    else:
-        msg += "\nNo closed trades yet."
-    send_telegram(msg)
+    msg_lines = [
+        f"📊 <b>EOD Report — {date_label}</b>",
+        day_icon,
+        "",
+        f"<b>TOTAL: {len(today_rows)} signals | {len(all_closed)} closed | ✅{total_wins} ❌{total_sls} | 💰 ₹{total_pnl:+,.0f}</b>",
+        "─" * 30,
+    ]
+
+    for win_key in ('regular_ce', 'tuesday_pe', 'evening_pe'):
+        if win_key in window_groups:
+            block, _ = _window_block(win_key, window_groups[win_key])
+            msg_lines.extend(block)
+
+    # Any unknown window keys
+    for win_key, win_rows in window_groups.items():
+        if win_key not in ('regular_ce', 'tuesday_pe', 'evening_pe'):
+            block, _ = _window_block(win_key, win_rows)
+            msg_lines.extend(block)
+
+    send_telegram("\n".join(msg_lines))
 
 
 # ─── MAIN ───
@@ -2015,11 +2253,15 @@ def run_scanner():
     if _today_live:
         last_dir     = _today_live[-1].get("signal")   # BUY or SELL
         alerts_today = len(_today_live)
-        print(f"  [restore] {len(_today_live)} LIVE trade(s) already today — last_dir={last_dir} (blocking new same-dir signals)")
+        _CLOSED_OUTCOMES = ("TARGET", "TRAIL", "SL", "BE", "WEAK", "EOD", "MANUAL", "GTT")
+        _any_closed = any(r.get("outcome") in _CLOSED_OUTCOMES for r in _today_live)
+        if _any_closed:
+            live_trade_done_today = True
+        print(f"  [restore] {len(_today_live)} LIVE trade(s) already today — last_dir={last_dir} live_trade_done={live_trade_done_today}")
         send_telegram(
             f"♻️ <b>Scanner restarted mid-day</b>\n"
-            f"{len(_today_live)} LIVE trade(s) found today — same-direction signals BLOCKED\n"
-            f"last_dir={last_dir} | alerts={alerts_today}"
+            f"{len(_today_live)} LIVE trade(s) found today — signals BLOCKED for rest of day\n"
+            f"last_dir={last_dir} | alerts={alerts_today} | exec_blocked={live_trade_done_today}"
         )
 
     _s = get_live_stats()
@@ -2041,8 +2283,10 @@ def run_scanner():
     last_position_signal_candle = None
     last_signal_candle = None
     no_signal_alerted = False
+    last_pe_candle = None; pe_signals_today = 0
     tue_alerts_today = 0; last_tue_candle = None; tue_window_opened = False
     tue_eve_alerts_today = 0; last_tue_eve_candle = None; tue_eve_window_opened = False
+    eve_pe_alerts_today = 0; last_eve_pe_candle = None; eve_pe_window_opened = False
 
     while True:
         try:
@@ -2054,13 +2298,17 @@ def run_scanner():
                 last_signal_candle = None
                 window_opened_today = False
                 daily_pnl_rs         = 0.0
+                live_trade_done_today = False
                 eod_report_sent      = False
                 premarket_sent       = False
                 spike_disarmed_today = False
                 no_signal_alerted    = False
+                last_pe_candle = None; pe_signals_today = 0
                 _symbol_cache.clear()   # fresh instruments lookup each new trading day
                 tue_alerts_today = 0; last_tue_candle = None; tue_window_opened = False
                 tue_eve_alerts_today = 0; last_tue_eve_candle = None; tue_eve_window_opened = False
+                eve_pe_alerts_today = 0; last_eve_pe_candle = None; eve_pe_window_opened = False
+                paper_positions.clear()  # reset virtual positions each day
                 print(f"\n📅 New day: {cd}")
                 if login():
                     print("🔐 Re-logged in for new day")
@@ -2072,52 +2320,19 @@ def run_scanner():
                 sleep_poll(3600); continue
 
             if now.weekday() == EXPIRY_WEEKDAY and position is None:
-                # ─── TUESDAY MORNING PE WINDOW (9:30-10:30, signal only) ───
-                if dtime(9, 30) <= ct <= TUESDAY_END:
-                    if not tue_window_opened:
-                        tue_window_opened = True
-                        _ts = get_tuesday_stats()
-                        _tue_perf = _stats_line(_ts, label="Tue PE") if _ts else "No Tuesday trades yet"
-                        send_telegram(
-                            "📉 <b>Tuesday Morning Window OPEN</b> (09:30-10:30)\n\n"
-                            "Strategy: <b>PE (SELL) only — ATM, 4 conditions</b>\n"
-                            "  VWAP + Supertrend + Breakdown + Bear clean candle\n"
-                            f"  SL: prev high + {CANDLE_SL_BUFFER}pt | Target: {TARGET_PTS}pt\n"
-                            f"📊 {_tue_perf}\n\n"
-                            "⏰ Evening window opens at 13:00\n"
-                            "⚠️ <i>SIGNAL ONLY — no auto-execution on Tuesday</i>"
-                        )
-                    df5 = fetch_data(NIFTY_TOKEN, "5minute", days=5)
-                    if df5 is not None:
-                        sig, price, info = check_tuesday_signals(df5)
-                        if price:
-                            print(f"  [{now.strftime('%H:%M')}] Tue Morn PE scan | Nifty:{price:.2f} | Signal:{sig or 'None'}")
-                        sig_candle = df5.index[-2] if len(df5) >= 2 else None
-                        if sig == "SELL" and sig_candle != last_tue_candle:
-                            last_tue_candle = sig_candle
-                            tue_alerts_today += 1
-                            opt_ltp = None
-                            try:
-                                _sym = find_option_symbol(price, "SELL")
-                                if _sym:
-                                    opt_ltp = kite.quote([f"NFO:{_sym}"])[f"NFO:{_sym}"]["last_price"]
-                            except Exception:
-                                pass
-                            send_telegram(format_tuesday_alert(price, info, tue_alerts_today, opt_ltp))
-                            log_tuesday_signal(price, info, option_ltp=opt_ltp, window="morning")
-                        elif sig == "SIDEWAYS":
-                            rng = info.get("recent_range", 0) if info else 0
-                            print(f"  📊 Tue Morn sideways ({rng:.0f}pt) — waiting")
-                    sleep_poll(1); continue
+                # ─── TUESDAY — no morning window, only evening PE ───────────
+                if ct < TUESDAY_EVENING_START:
+                    print(f"⏳ [{now.strftime('%H:%M')}] Tuesday — waiting for evening PE window (13:00-14:00)")
+                    sleep_poll(300); continue
 
-                # ─── TUESDAY EVENING PE WINDOW (13:00-14:30, signal only) ───
+                # ─── TUESDAY EVENING PE WINDOW (13:00-14:00, signal only) ───
                 elif TUESDAY_EVENING_START <= ct <= TUESDAY_EVENING_END:
                     if not tue_eve_window_opened:
                         tue_eve_window_opened = True
                         _ts = get_tuesday_stats()
                         _tue_perf = _stats_line(_ts, label="Tue PE") if _ts else "No Tuesday trades yet"
                         send_telegram(
-                            "📉 <b>Tuesday Evening Window OPEN</b> (13:00-14:30)\n\n"
+                            "📉 <b>Tuesday Evening Window OPEN</b> (13:00-14:00)\n\n"
                             "Strategy: <b>PE (SELL) only — ATM, 4 conditions</b>\n"
                             "  VWAP + Supertrend + Breakdown + Bear clean candle\n"
                             f"  SL: prev high + {CANDLE_SL_BUFFER}pt | Target: {TUESDAY_EVENING_TARGET}pt\n"
@@ -2132,17 +2347,24 @@ def run_scanner():
                             print(f"  [{now.strftime('%H:%M')}] Tue Eve PE scan | Nifty:{price:.2f} | Signal:{sig or 'None'}")
                         sig_candle = df5.index[-2] if len(df5) >= 2 else None
                         if sig == "SELL" and sig_candle != last_tue_eve_candle:
-                            last_tue_eve_candle = sig_candle
-                            tue_eve_alerts_today += 1
-                            opt_ltp = None
-                            try:
-                                _sym = find_option_symbol(price, "SELL")
-                                if _sym:
-                                    opt_ltp = kite.quote([f"NFO:{_sym}"])[f"NFO:{_sym}"]["last_price"]
-                            except Exception:
-                                pass
-                            send_telegram(format_tuesday_evening_alert(price, info, tue_eve_alerts_today, opt_ltp))
-                            log_tuesday_signal(price, info, option_ltp=opt_ltp, window="evening")
+                            sl_dist = (info.get("prev_high", price) + CANDLE_SL_BUFFER) - price if info else 0
+                            if sl_dist > MAX_CANDLE_SL_PTS:
+                                print(f"  ⚠️ Tue Eve PE SL too wide ({sl_dist:.0f}pt) — skipping")
+                            else:
+                                last_tue_eve_candle = sig_candle
+                                tue_eve_alerts_today += 1
+                                opt_ltp = None
+                                try:
+                                    _sym = find_option_symbol(price, "SELL")
+                                    if _sym:
+                                        opt_ltp = kite.quote([f"NFO:{_sym}"])[f"NFO:{_sym}"]["last_price"]
+                                except Exception:
+                                    pass
+                                send_telegram(format_tuesday_evening_alert(price, info, tue_eve_alerts_today, opt_ltp))
+                                log_tuesday_signal(price, info, option_ltp=opt_ltp, window="evening")
+                                # Cross-log to live_signal_log.csv for unified tracking
+                                _tue_ph = info.get("prev_high", price) if info else price
+                                log_live_signal("SELL", price, _tue_ph, mode="SIGNAL", info=info, option_ltp=opt_ltp, window="tuesday_pe")
                         elif sig == "SIDEWAYS":
                             rng = info.get("recent_range", 0) if info else 0
                             print(f"  📊 Tue Eve sideways ({rng:.0f}pt) — waiting")
@@ -2160,11 +2382,11 @@ def run_scanner():
                     # Evening window just closed
                     if tue_eve_window_opened and ct > TUESDAY_EVENING_END:
                         if tue_eve_alerts_today == 0:
-                            send_telegram("📭 <b>Tuesday evening window closed (14:30)</b> — no PE signal today.")
+                            send_telegram("📭 <b>Tuesday evening window closed (14:00)</b> — no PE signal today.")
                         else:
-                            send_telegram(f"🔒 <b>Tuesday evening window closed (14:30)</b> — {tue_eve_alerts_today} PE signal(s) sent today.")
+                            send_telegram(f"🔒 <b>Tuesday evening window closed (14:00)</b> — {tue_eve_alerts_today} PE signal(s) sent today.")
                         tue_eve_window_opened = False
-                    print(f"⏳ [{now.strftime('%H:%M')}] Tuesday — outside PE windows (9:30-10:30 / 13:00-14:30)")
+                    print(f"⏳ [{now.strftime('%H:%M')}] Tuesday — outside PE windows (9:30-10:30 / 13:00-14:00)")
                     sleep_poll(300); continue
 
             # ─── PRE-MARKET ALERT (9:24-9:29) ────────────────────────────────
@@ -2194,6 +2416,14 @@ def run_scanner():
             # ─── EOD REPORT (3:30 PM) ─────────────────────────────────────────
             if not eod_report_sent and ct >= dtime(15, 30):
                 eod_report_sent = True
+                # Close any paper positions still open at market close
+                try:
+                    _eod_ltp = kite.ltp(["NSE:NIFTY 50"])
+                    _eod_spot = float(_eod_ltp["NSE:NIFTY 50"]["last_price"])
+                except Exception:
+                    _eod_spot = 0.0
+                if paper_positions:
+                    close_all_paper_positions_eod(_eod_spot)
                 send_eod_report()
 
             # ─── POSITION MONITORING (runs all day regardless of window) ───
@@ -2216,7 +2446,59 @@ def run_scanner():
                         pass
                     print(f"  [{now.strftime('%H:%M')}] Monitoring {position['symbol']} | Nifty: {current_price:.2f} | Option: {opt_ltp or 'N/A'}")
                     monitor_position(current_price, option_ltp=opt_ltp)
+                    monitor_paper_positions(current_price)
                 sleep_poll(30); continue  # 30s poll — real-time LTP catches intracandle moves
+
+            # ─── EVENING PE WINDOW (13:00-14:00, Mon/Wed/Thu/Fri, signal-only) ───
+            if now.weekday() != EXPIRY_WEEKDAY and EVENING_PE_START <= ct <= EVENING_PE_END and position is None:
+                if not eve_pe_window_opened:
+                    eve_pe_window_opened = True
+                    send_telegram(
+                        f"🌆 <b>Evening PE Window OPEN</b> ({EVENING_PE_START.strftime('%H:%M')}–{EVENING_PE_END.strftime('%H:%M')})\n\n"
+                        "Strategy: <b>PE (SELL) only — ATM, 4 conditions</b>\n"
+                        "  VWAP + Supertrend + Breakdown + Bear clean candle\n"
+                        f"  🛑 SL: prev high + {CANDLE_SL_BUFFER}pt  🎯 Target: {EVENING_PE_TARGET}pt\n\n"
+                        "⚠️ <i>SIGNAL ONLY — no auto-execution in evening window</i>"
+                    )
+                df5 = fetch_data(NIFTY_TOKEN, "5minute", days=5)
+                if df5 is not None:
+                    sig, price, info = check_tuesday_signals(df5)
+                    if price:
+                        print(f"  [{now.strftime('%H:%M')}] Eve PE scan | Nifty:{price:.2f} | Signal:{sig or 'None'}")
+                    sig_candle = df5.index[-2] if len(df5) >= 2 else None
+                    if sig == "SELL" and sig_candle != last_eve_pe_candle:
+                        sl_dist = (info.get("prev_high", price) + CANDLE_SL_BUFFER) - price if info else 0
+                        if sl_dist > MAX_CANDLE_SL_PTS:
+                            print(f"  ⚠️ Eve PE SL too wide ({sl_dist:.0f}pt) — skipping")
+                        else:
+                            last_eve_pe_candle = sig_candle
+                            eve_pe_alerts_today += 1
+                            opt_ltp = None
+                            try:
+                                _sym = find_option_symbol(price, "SELL")
+                                if _sym:
+                                    opt_ltp = kite.quote([f"NFO:{_sym}"])[f"NFO:{_sym}"]["last_price"]
+                            except Exception:
+                                pass
+                            send_telegram(format_evening_pe_alert(price, info, eve_pe_alerts_today, opt_ltp))
+                            log_tuesday_signal(price, info, option_ltp=opt_ltp, window="evening_pe")
+                            # Cross-log to live_signal_log.csv for unified tracking
+                            _eve_ph = info.get("prev_high", price) if info else price
+                            log_live_signal("SELL", price, _eve_ph, mode="SIGNAL", info=info, option_ltp=opt_ltp, window="evening_pe")
+                    elif sig == "SIDEWAYS":
+                        rng = info.get("recent_range", 0) if info else 0
+                        print(f"  📊 Eve PE sideways ({rng:.0f}pt) — waiting")
+                    if price and paper_positions:
+                        monitor_paper_positions(price)
+                sleep_poll(1); continue
+
+            # close notification once window ends
+            if eve_pe_window_opened and ct > EVENING_PE_END and now.weekday() != EXPIRY_WEEKDAY:
+                if eve_pe_alerts_today == 0:
+                    send_telegram("📭 <b>Evening PE window closed (14:00)</b> — no signal today.")
+                else:
+                    send_telegram(f"🔒 <b>Evening PE window closed (14:00)</b> — {eve_pe_alerts_today} signal(s) sent.")
+                eve_pe_window_opened = False
 
             # ─── OUTSIDE SCAN WINDOW — idle (spike detector still runs) ───
             if ct < MORNING_START or ct > MORNING_END:
@@ -2261,15 +2543,16 @@ def run_scanner():
                 print(f"  [{now.strftime('%H:%M')}] Nifty:{price:.2f} | Signal:{signal or 'None'} | Auto:{'ON' if AUTO_ARMED else 'OFF'}")
 
             if signal == "SKIP":
-                print("  ⛔ Doji — skipping")
+                print("  ⛔ Doji or B1 filter — skipping")
             elif signal == "SIDEWAYS":
                 rng = info.get("recent_range", 0) if info else 0
                 print(f"  📊 Sideways ({rng:.0f}pt range) — skipping")
                 send_market_status(price, info, alerts_today)
-            elif signal in ("BUY", "SELL"):
+
+            # ── CE SIGNAL (BUY — may auto-execute) ──────────────────────────
+            elif signal == "BUY":
                 if position is not None:
-                    # Position open — send full info signal for each NEW candle so user can act manually
-                    # Deduplicate by candle timestamp (avoid 30s-poll spam on same candle)
+                    # Position open — send info alert for each NEW candle
                     sig_candle = df5.index[-2] if len(df5) >= 2 else None
                     if sig_candle != last_position_signal_candle:
                         last_position_signal_candle = sig_candle
@@ -2277,61 +2560,64 @@ def run_scanner():
                         curr_low = info.get("curr_low", price * 0.998) if info else price * 0.998
                         opt_ltp = None
                         try:
-                            _sym = find_option_symbol(price, signal)
+                            _sym = find_option_symbol(price, "BUY")
                             if _sym:
                                 opt_ltp = kite.quote([f"NFO:{_sym}"])[f"NFO:{_sym}"]["last_price"]
                         except Exception:
                             pass
-                        alert_msg = format_alert(signal, price, info, alerts_today, option_ltp=opt_ltp)
-                        alert_msg += f"\n\n⚠️ <i>Position already open ({position['symbol']}) — no new order. Manual check if needed.</i>"
+                        alert_msg = format_alert("BUY", price, info, alerts_today, option_ltp=opt_ltp)
+                        alert_msg += f"\n\n⚠️ <i>Position already open ({position['symbol']}) — no new order.</i>"
                         send_telegram(alert_msg)
-                        print(f"  🌅 {signal} signal (info only — position open: {position['symbol']})")
+                        print(f"  🌅 BUY signal (info only — position open: {position['symbol']})")
                     else:
-                        print(f"  ⏭️ Same candle {signal} (position open) — already notified")
-                elif signal == last_dir:
-                    print(f"  ⏭️ Duplicate {signal} — skipping")
+                        print(f"  ⏭️ Same candle BUY (position open) — already notified")
+                elif "BUY" == last_dir:
+                    print(f"  ⏭️ Duplicate BUY — skipping")
                 elif (df5.index[-2] if len(df5) >= 2 else None) == last_signal_candle:
-                    print(f"  ⏭️ Same candle as last execution attempt — waiting for new candle")
+                    print(f"  ⏭️ Same candle as last attempt — waiting for new candle")
                 else:
                     sig_candle_now = df5.index[-2] if len(df5) >= 2 else None
                     last_signal_candle = sig_candle_now
-                    _prev_dir = last_dir   # save before modifying — needed for SL-too-wide restore
-                    alerts_today += 1; last_dir = signal
+                    _prev_dir = last_dir
+                    alerts_today += 1; last_dir = "BUY"
                     last_heartbeat = now
                     curr_low = info.get("curr_low", price * 0.998) if info else price * 0.998
                     _sl_dist = price - curr_low + CANDLE_SL_BUFFER
                     if _sl_dist > MAX_CANDLE_SL_PTS:
-                        print(f"  ⚠️ SL too wide ({_sl_dist:.1f}pt > {MAX_CANDLE_SL_PTS}pt) — skipping signal")
-                        send_telegram(f"⚠️ Signal detected but SL too wide ({_sl_dist:.1f}pt risk) — skipped (max {MAX_CANDLE_SL_PTS}pt)")
+                        print(f"  ⚠️ CE SL too wide ({_sl_dist:.1f}pt > {MAX_CANDLE_SL_PTS}pt) — skipping signal")
+                        send_telegram(f"⚠️ CE signal detected but SL too wide ({_sl_dist:.1f}pt risk) — skipped (max {MAX_CANDLE_SL_PTS}pt)")
                         alerts_today -= 1
-                        last_dir = _prev_dir   # restore — if a trade already ran today, keep it blocked
+                        last_dir = _prev_dir
                         continue
-                    print(f"  🌅 {signal} alert #{alerts_today} | AUTO_ARMED={AUTO_ARMED}")
-                    # Fetch option LTP so signal message shows it for manual entry
+                    print(f"  🌅 BUY (CE) alert #{alerts_today} | AUTO_ARMED={AUTO_ARMED}")
                     opt_ltp = None
                     try:
-                        _sym = find_option_symbol(price, signal)
+                        _sym = find_option_symbol(price, "BUY")
                         if _sym:
                             opt_ltp = kite.quote([f"NFO:{_sym}"])[f"NFO:{_sym}"]["last_price"]
                     except Exception:
                         pass
-                    send_telegram(format_alert(signal, price, info, alerts_today, option_ltp=opt_ltp))
-                    log_live_signal(signal, price, curr_low, info=info, option_ltp=opt_ltp)
+                    send_telegram(format_alert("BUY", price, info, alerts_today, option_ltp=opt_ltp))
+                    log_live_signal("BUY", price, curr_low, info=info, option_ltp=opt_ltp, window="regular_ce")
 
-                    # Start 30s broadcast regardless — shows exec status live
-                    if AUTO_ARMED:
+                    if AUTO_ARMED and not live_trade_done_today:
                         start_signal_alerts(
-                            find_option_symbol(price, signal) or signal,
-                            opt_ltp or 0, signal, curr_low - CANDLE_SL_BUFFER
+                            find_option_symbol(price, "BUY") or "BUY",
+                            opt_ltp or 0, "BUY", curr_low - CANDLE_SL_BUFFER
                         )
-                        success = execute_entry(signal, price, curr_low)
+                        success = execute_entry("BUY", price, curr_low)
                         if not success:
-                            # Order failed — reset so next valid signal can retry
                             last_dir = None
                             alerts_today -= 1
+                    elif AUTO_ARMED and live_trade_done_today:
+                        print(f"  🚫 Second live trade blocked (live_trade_done_today=True)")
+
 
             if price and info:
                 send_market_status(price, info, alerts_today)
+
+            if price and paper_positions:
+                monitor_paper_positions(price)
 
             check_spike(df5)   # spike detector runs inside window too, reuses fetched df5
             sleep_poll(1)      # 1s poll — max detection delay ~3s (fetch ~2s + sleep 1s)

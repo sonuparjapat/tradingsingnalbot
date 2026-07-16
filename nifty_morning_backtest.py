@@ -8,7 +8,7 @@ Backtests the CE-only morning scanner strategy:
   SL: signal candle low - 5pt | Target: 25pt fixed
 
 Tuesday windows also backtested:
-  Morning PE: 9:30-10:30 | Evening PE: 13:00-14:30 (signal-only)
+  Morning PE: 9:30-10:30 | Evening PE: 13:00-14:00 (signal-only)
 =============================================================
 """
 
@@ -212,7 +212,7 @@ def analyze_candle(o,h,l,c):
     if tr==0: return True,False,False
     uw=h-max(o,c); lw=min(o,c)-l
     doji=(body/tr)<0.1
-    return doji,(not doji and c>o and uw<=body),(not doji and c<o and lw<=body)
+    return doji,(not doji and c>o and uw<=body and lw<=body),(not doji and c<o and lw<=body)
 
 
 def estimate_premium_pts(entry_price, exit_price, signal, is_expiry_day, delta_base=DELTA_ATM):
@@ -283,11 +283,20 @@ def run_backtest(df5, days=60, ce_only=False, candle_sl=False,
             if recent_range < sideways_range_pt:
                 continue
 
-        # ATM: 4 conditions — VWAP + Supertrend + Breakout + Clean candle
+        # ── B1 filter: direction-aware prev candle wick check ──
+        # CE (BUY): prev candle upper wick > body = seller rejection at breakout high → skip
+        # PE (SELL): prev candle lower wick > body = buyer support at breakdown low → skip
+        prev_body_b1 = abs(float(prev['Close']) - float(prev['Open']))
+        prev_uw_b1   = float(prev['High']) - max(float(prev['Open']), float(prev['Close']))
+        prev_lw_b1   = min(float(prev['Open']), float(prev['Close'])) - float(prev['Low'])
+        ce_b1 = not (prev_body_b1 > 0 and prev_uw_b1 > prev_body_b1)
+        pe_b1 = not (prev_body_b1 > 0 and prev_lw_b1 > prev_body_b1)
+
+        # ATM: 4 conditions — VWAP + Supertrend + Breakout/Breakdown + Clean candle + B1
         breakout  = price > ph
         breakdown = price < pl
-        buy_ok  = all([price > vwap, st == True,  breakout,  bull_clean])
-        sell_ok = all([price < vwap, st == False, breakdown, bear_clean])
+        buy_ok  = all([price > vwap, st == True,  breakout,  bull_clean, ce_b1])
+        sell_ok = all([price < vwap, st == False, breakdown, bear_clean, pe_b1])
 
         if buy_ok and last_sig.get(date) != "BUY":
             signal = "BUY"
@@ -419,7 +428,7 @@ def run_backtest(df5, days=60, ce_only=False, candle_sl=False,
 TUESDAY_ENTRY_WIN          = (dtime(9, 30),  dtime(10, 30))
 TUESDAY_TARGET_PTS         = 25
 TUESDAY_SIDEWAYS_PT        = 30
-TUESDAY_EVENING_WIN        = (dtime(13, 0), dtime(14, 30))
+TUESDAY_EVENING_WIN        = (dtime(13, 0), dtime(14,  0))
 TUESDAY_EVENING_TARGET_PTS = 20
 
 
@@ -427,7 +436,7 @@ def run_tuesday_backtest(df5, days=90, bt_lots=1, pe_only=True, window="morning"
     """
     Tuesday-only backtest — ATM, PE-only.
     window="morning" → 9:30-10:30, 25pt target (100% WR)
-    window="evening" → 13:00-14:30, 20pt target (100% WR)
+    window="evening" → 13:00-14:00, 20pt target (100% WR)
     pe_only=True  → PE (SELL) signals only — default, best WR
     pe_only=False → CE+PE both
     Returns (trades_list, summary_dict).
@@ -450,6 +459,7 @@ def run_tuesday_backtest(df5, days=90, bt_lots=1, pe_only=True, window="morning"
         tue_windows=tue_win,
         skip_expiry=False,          # include Tuesdays
         sideways_range_pt=TUESDAY_SIDEWAYS_PT,
+        max_sl_pts=50,              # same 50pt index cap as morning CE
     )
 
     if not trades:
@@ -610,10 +620,10 @@ def main():
                   f"{r['entry']:>8.1f} {r['outcome']:<8} Rs{r['pnl_rs']:>6.0f} {r['max_fav']:>7.1f}pt")
         print(sep)
 
-    # ── Tuesday EVENING strategy (13:00-14:30) ───────────────────────────
+    # ── Tuesday EVENING strategy (13:00-14:00) ───────────────────────────
     print()
     print(sep)
-    print("  TUESDAY EVENING WINDOW — PE only | 13:00-14:30 | 20pt target")
+    print("  TUESDAY EVENING WINDOW — PE only | 13:00-14:00 | 20pt target")
     print("  (Expiry day max theta decay — selling pressure window)")
     print(sep)
     e_trades, e_sum = run_tuesday_backtest(df5, days=DAYS, window="evening")
