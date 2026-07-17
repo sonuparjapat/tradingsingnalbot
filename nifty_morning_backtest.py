@@ -499,6 +499,59 @@ def run_tuesday_backtest(df5, days=90, bt_lots=1, pe_only=True, window="morning"
     return tdf.to_dict('records'), summary
 
 
+EVENING_PE_WIN        = (dtime(13, 0), dtime(14, 0))
+EVENING_PE_TARGET_PTS = 20
+EVENING_PE_SIDEWAYS_PT = 30
+
+
+def run_evening_pe_backtest(df5, days=90, bt_lots=1):
+    """
+    Evening PE backtest — Mon/Wed/Thu/Fri only, 13:00-14:00, 20pt target.
+    Same 5 conditions as morning CE but bearish side (SELL signals only).
+    Tuesday is excluded via skip_expiry=True.
+    """
+    trades = run_backtest(
+        df5,
+        days=days,
+        ce_only=False,
+        candle_sl=True,
+        signal_candle_sl=True,
+        target_pts=EVENING_PE_TARGET_PTS,
+        entry_windows=[EVENING_PE_WIN],
+        skip_expiry=True,           # exclude Tuesday
+        sideways_range_pt=EVENING_PE_SIDEWAYS_PT,
+        max_sl_pts=50,
+    )
+
+    if not trades:
+        return [], {}
+
+    tdf = pd.DataFrame(trades)
+    # Keep only SELL signals (PE) and only Mon/Wed/Thu/Fri (already excluded Tue via skip_expiry)
+    tdf = tdf[tdf['signal'] == 'SELL'].reset_index(drop=True)
+
+    if tdf.empty:
+        return [], {}
+
+    total = len(tdf)
+    wins  = len(tdf[tdf['outcome'].isin(['TARGET', 'TRAIL'])])
+    tgt   = len(tdf[tdf['outcome'] == 'TARGET'])
+    trail = len(tdf[tdf['outcome'] == 'TRAIL'])
+    be    = len(tdf[tdf['outcome'] == 'BE'])
+    weak  = len(tdf[tdf['outcome'] == 'WEAK'])
+    sl    = len(tdf[tdf['outcome'] == 'SL'])
+    wr    = wins / total * 100
+    net   = tdf['pnl_rs'].sum() * bt_lots
+
+    summary = dict(
+        total=total, wins=wins, tgt=tgt, trail=trail, be=be, weak=weak, sl=sl,
+        wr=wr, net=net,
+        period_start=str(tdf.iloc[0]['date']), period_end=str(tdf.iloc[-1]['date']),
+        days_traded=len(set(tdf['date'])),
+    )
+    return tdf.to_dict('records'), summary
+
+
 # ─── MAIN ───
 def main():
     sep = "="*72
@@ -510,7 +563,7 @@ def main():
     if not login(): return
 
     DAYS     = 90
-    LIVE_WIN = [(dtime(9, 30), dtime(13, 0))]
+    LIVE_WIN = [(dtime(9, 30), dtime(10, 30))]
 
     print(f"Fetching {DAYS} days of Nifty 5-min data...")
     df5 = fetch_data(NIFTY_TOKEN, "5minute", days=DAYS)
@@ -803,16 +856,42 @@ def main():
                       f"entry={sr['entry']:.1f}  outcome={sr['outcome']}  PnL=Rs{sr['pnl_rs']:.0f}")
     print(sep)
 
-    # ── GRAND TOTAL (main + both Tuesday windows) ─────────────────────────
+    # ── Evening PE strategy (Mon/Wed/Thu/Fri, 13:00-14:00) ───────────────
     print()
     print(sep)
-    print("  GRAND TOTAL — MAIN + TUESDAY (MORNING + EVENING)")
+    print("  EVENING PE WINDOW — PE only | 13:00-14:00 | Mon/Wed/Thu/Fri | 20pt target")
+    print("  (Post-lunch fade — same 5 conditions as morning CE but bearish side)")
     print(sep)
-    grand_total = total + at_total
-    grand_wins  = wins  + at_wins
-    grand_net   = net   + at_net
+    ep_trades, ep_sum = run_evening_pe_backtest(df5, days=DAYS)
+    if not ep_trades:
+        print("  No Evening PE signals found (Mon/Wed/Thu/Fri, 13:00-14:00).")
+        ep_total = ep_wins = ep_net = 0; ep_wr = 0
+    else:
+        es2 = ep_sum
+        ep_total = es2['total']; ep_wins = es2['wins']; ep_net = es2['net']; ep_wr = es2['wr']
+        print(f"  Period  : {es2['period_start']} to {es2['period_end']}")
+        print(f"  Days    : {es2['days_traded']} trading days with a signal")
+        print(f"  Trades  : {es2['total']}")
+        print(f"  Win Rate: {es2['wr']:.1f}%  (TARGET={es2['tgt']}  TRAIL={es2['trail']}  BE={es2['be']}  WEAK={es2['weak']}  SL={es2['sl']})")
+        print(f"  Net PnL : Rs{es2['net']:,.0f}  (1 lot of {LOT_SIZE})")
+        print(sep)
+        print(f"\n  {'Date':<12} {'Time':<6} {'Entry':>8} {'Outcome':<8} {'PnL':>8} {'MaxFav':>8}")
+        print(f"  {'-'*58}")
+        for r in ep_trades:
+            print(f"  {str(r['date']):<12} {str(r.get('time','')):<6} "
+                  f"{r['entry']:>8.1f} {r['outcome']:<8} Rs{r['pnl_rs']:>6.0f} {r['max_fav']:>7.1f}pt")
+        print(sep)
+
+    # ── GRAND TOTAL (main + Tuesday + Evening PE) ─────────────────────────
+    print()
+    print(sep)
+    print("  GRAND TOTAL — MAIN + TUESDAY + EVENING PE")
+    print(sep)
+    grand_total = total + at_total + ep_total
+    grand_wins  = wins  + at_wins  + ep_wins
+    grand_net   = net   + at_net   + ep_net
     grand_wr    = grand_wins / grand_total * 100 if grand_total else 0
-    print(f"  Trades  : {grand_total}  (Main={total}  Tue-Morn={len(m_trades)}  Tue-Eve={len(e_trades)})")
+    print(f"  Trades  : {grand_total}  (Main={total}  Tue-Morn={len(m_trades)}  Tue-Eve={len(e_trades)}  Eve-PE={ep_total})")
     print(f"  Win Rate: {grand_wr:.1f}%")
     print(f"  Net PnL : Rs{grand_net:,.0f}  (1 lot x {LOT_SIZE})")
     print(f"  Monthly : Rs{grand_net/3:,.0f}/month")

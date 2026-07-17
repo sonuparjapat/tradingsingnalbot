@@ -54,8 +54,8 @@ MAX_CANDLE_SL_PTS = 50   # skip signal if SL distance > this (risk cap: limits m
 # This is the ONLY thing that makes this scanner different in scope from the
 # main bot: a narrow morning window, and far fewer required conditions.
 MORNING_START  = dtime(9, 30)
-MORNING_END    = dtime(13, 0)
-MAX_ALERTS     = 6
+MORNING_END    = dtime(10, 30)
+MAX_ALERTS     = 1
 HEARTBEAT_MINS = 20
 
 EXPIRY_WEEKDAY = 1  # Tuesday — no morning signals on expiry day
@@ -131,6 +131,7 @@ eod_report_sent    = False  # True after 3:30 PM report sent today
 premarket_sent     = False  # True after 9:25 AM pre-market alert sent today
 spike_disarmed_today = False  # True after spike auto-disarmed at 2:40 PM today
 live_trade_done_today = False  # True once a LIVE position closes — blocks second execution same day
+pe_signal_done_today  = False  # True once any PE signal (tuesday_pe / evening_pe) is logged today
 
 SPIKE_ARMED     = False  # separate from AUTO_ARMED — monitors intracandle momentum
 SPIKE_THRESHOLD = int(os.getenv("SPIKE_THRESHOLD", "50"))  # pts move within a 5-min candle
@@ -323,7 +324,7 @@ def run_remote_backtest(days, trail_enabled=True, bt_lots=1):
             mbt.TRAIL_TRIGGER_MULT = 999999
         trades = mbt.run_backtest(df5, days=days, ce_only=True,
                                        candle_sl=True, target_pts=25,
-                                       entry_windows=[(mbt.dtime(9,30), mbt.dtime(13,0))],
+                                       entry_windows=[(mbt.dtime(9,30), mbt.dtime(10,30))],
                                        skip_expiry=True, sideways_range_pt=30,
                                        signal_candle_sl=True, max_sl_pts=50)
         mbt.BREAKEVEN_PCT      = orig_bepct
@@ -935,7 +936,7 @@ def place_gtt_oco(symbol, qty, sl_premium, target_premium, last_price):
 
 def modify_gtt_sl(gtt_id, symbol, qty, new_sl, target_premium, last_price):
     try:
-        sl_limit = round(new_sl - 1.5, 1)
+        sl_limit = round(new_sl - 0.5, 1)
         kite.modify_gtt(
             trigger_id=gtt_id, trigger_type=kite.GTT_TYPE_OCO,
             tradingsymbol=symbol, exchange=kite.EXCHANGE_NFO,
@@ -1163,7 +1164,7 @@ def log_live_signal(signal, price, sl_ref, symbol="", entry_premium=0,
     # Open a virtual paper position to auto-track outcome (target/SL/EOD) in the CSV
     # Skip regular_ce when AUTO_ARMED — real position monitor will handle it instead
     if mode == "SIGNAL" and not (AUTO_ARMED and window == "regular_ce"):
-        _open_paper_position(signal, round(price, 2), sl_spot, target_spot, _tgt, window, now)
+        _open_paper_position(signal, round(price, 2), sl_spot, target_spot, _tgt, window, now, entry_premium=option_ltp or 0)
 
 def update_log_last_open(**kwargs):
     """Promote the most recent SIGNAL row to OPEN — called after order actually fills."""
@@ -1190,40 +1191,52 @@ def log_live_exit(outcome, exit_spot=0, exit_premium=0, pnl_rs=0, max_fav_pt=0):
     print(f"  [log] Exit logged: {outcome}")
 
 # ─── PAPER POSITION TRACKER (virtual outcome for signal-only signals) ────────
-def _open_paper_position(signal, entry_spot, sl_spot, target_spot, target_pts, window, open_time):
+def _open_paper_position(signal, entry_spot, sl_spot, target_spot, target_pts, window, open_time, entry_premium=0):
     """Register a virtual position to track outcome even when no real order is placed."""
+    be_threshold = entry_spot * BREAKEVEN_PCT
     paper_positions[window] = {
-        "signal":       signal,
-        "entry_spot":   entry_spot,
-        "sl_spot":      sl_spot,       # updated to breakeven when BE triggers
-        "sl_original":  sl_spot,       # fixed: used for SL loss calculation
-        "target_spot":  target_spot,
-        "target_pts":   target_pts,
-        "date_str":     open_time.strftime("%Y-%m-%d"),
-        "time_str":     open_time.strftime("%H:%M"),
-        "peak_fav":     0.0,
-        "be_hit":       False,
+        "signal":        signal,
+        "entry_spot":    entry_spot,
+        "sl_spot":       sl_spot,
+        "sl_original":   sl_spot,
+        "target_spot":   target_spot,
+        "target_pts":    target_pts,
+        "date_str":      open_time.strftime("%Y-%m-%d"),
+        "time_str":      open_time.strftime("%H:%M"),
+        "peak_fav":      0.0,
+        "be_hit":        False,
+        "trail_active":  False,
+        "be_threshold":  be_threshold,
+        "entry_premium": entry_premium or 0,
     }
-    print(f"  [paper] {window} paper position opened: {signal} @ {entry_spot:.2f} | tgt={target_spot:.2f} | sl={sl_spot:.2f}")
+    print(f"  [paper] {window} opened: {signal} @ {entry_spot:.2f} | sl={sl_spot:.2f} | tgt={target_spot:.2f} | be_thresh={be_threshold:.1f}pt")
+
+_PAPER_WIN_LABELS = {
+    "regular_ce": "CE Morning",
+    "evening_pe": "Evening PE",
+    "tuesday_pe": "Tuesday PE",
+}
 
 def _close_paper_position(window, outcome, exit_spot):
     """Close a paper position and write outcome + P&L back to live_signal_log.csv."""
     pp = paper_positions.pop(window, None)
     if pp is None: return
-    sig     = pp["signal"]
-    entry   = pp["entry_spot"]
-    tgt_p   = pp["target_pts"]
-    sl_orig = pp["sl_original"]
+    sig           = pp["signal"]
+    entry         = pp["entry_spot"]
+    tgt_p         = pp["target_pts"]
+    sl_orig       = pp["sl_original"]
+    max_fav       = round(pp.get("peak_fav", 0.0), 1)
+    entry_premium = pp.get("entry_premium", 0)
     if outcome == "TARGET":
         pnl_pts = tgt_p
     elif outcome == "SL":
         pnl_pts = -(abs(entry - sl_orig))
     elif outcome == "BE":
         pnl_pts = 0.0
-    else:  # EOD or WEAK — actual move at close
+    else:  # TRAIL, EOD, WEAK — actual spot move at close
         pnl_pts = (exit_spot - entry) if sig == "BUY" else (entry - exit_spot)
-    pnl_rs = round(pnl_pts * OPTION_DELTA * LOT_SIZE, 0)
-    # Update the matching signal row in live_signal_log.csv
+    pnl_rs       = round(pnl_pts * OPTION_DELTA * LOT_SIZE, 0)
+    exit_premium = round(entry_premium + pnl_pts * OPTION_DELTA, 1) if entry_premium else ""
     rows = _load_signal_log()
     for r in reversed(rows):
         if (r.get("date")   == pp["date_str"] and
@@ -1231,42 +1244,88 @@ def _close_paper_position(window, outcome, exit_spot):
             r.get("signal") == sig and
             r.get("time")   == pp["time_str"] and
             r.get("outcome") in ("SIGNAL", "OPEN", "")):
-            r["outcome"]   = outcome
-            r["exit_spot"] = round(float(exit_spot), 2)
-            r["pnl_rs"]    = pnl_rs
-            r["exit_time"] = datetime.now().strftime("%H:%M")
+            r["outcome"]      = outcome
+            r["exit_spot"]    = round(float(exit_spot), 2)
+            r["exit_premium"] = exit_premium
+            r["pnl_rs"]       = pnl_rs
+            r["max_fav_pt"]   = max_fav
+            r["exit_time"]    = datetime.now().strftime("%H:%M")
             break
     _save_signal_log(rows)
+    pnl_icon  = "💰" if pnl_rs >= 0 else "🔴"
+    win_label = _PAPER_WIN_LABELS.get(window, window.upper())
+    send_telegram(
+        f"📊 <b>PAPER TRACK — {win_label} CLOSED ({outcome})</b>\n\n"
+        f"{pnl_icon} P&L: ₹{pnl_rs:+,.0f}  |  Max move: +{max_fav:.1f}pt\n"
+        f"Exit spot: {exit_spot:.2f}"
+        + (f"  |  Option: ₹{exit_premium}" if exit_premium else "")
+    )
     print(f"  [paper] {window} closed: {outcome} | pnl_pts={pnl_pts:.1f} | Rs{pnl_rs:+.0f}")
 
 def monitor_paper_positions(current_spot):
-    """Check virtual exit conditions for all open paper positions — call every price poll."""
+    """Check virtual exit conditions — identical BE/trail logic to real CE/PE execution."""
     to_close = []
     for window, pp in list(paper_positions.items()):
-        sig = pp["signal"]
+        sig  = pp["signal"]
         entry = pp["entry_spot"]
         tgt   = pp["target_spot"]
+        be_threshold  = pp.get("be_threshold", entry * BREAKEVEN_PCT)
+        trail_trigger = be_threshold * TRAIL_TRIGGER_MULT
+        trail_step    = be_threshold * TRAIL_STEP_MULT
+        win_label     = _PAPER_WIN_LABELS.get(window, window.upper())
+
         if sig == "BUY":
             spot_move = current_spot - entry
             hit_tgt   = current_spot >= tgt
-        else:
+        else:  # SELL (PE)
             spot_move = entry - current_spot
             hit_tgt   = current_spot <= tgt
+
         pp["peak_fav"] = max(pp["peak_fav"], spot_move)
-        # BE: when 50% of target reached, move SL to entry price
-        if not pp["be_hit"] and pp["peak_fav"] >= pp["target_pts"] * 0.5:
-            pp["be_hit"]   = True
-            pp["sl_spot"]  = entry
-            print(f"  [paper] {window} BE activated @ {current_spot:.2f} (moved SL to {entry:.2f})")
-        # Check SL hit (may now be at breakeven)
+
+        # ── Breakeven (same threshold as real position) ──────────────────
+        if not pp["be_hit"] and pp["peak_fav"] >= be_threshold:
+            pp["be_hit"]  = True
+            pp["sl_spot"] = entry  # for both CE and PE: SL → entry = breakeven
+            print(f"  [paper] {window} BE @ {current_spot:.2f} → SL now {entry:.2f}")
+            send_telegram(
+                f"⚖️ <b>PAPER TRACK — {win_label} Breakeven</b>\n"
+                f"Virtual SL moved to entry: <b>{entry:.2f}</b>\n"
+                f"Peak move: +{pp['peak_fav']:.1f}pt — trade is risk-free"
+            )
+
+        # ── Trail (same TRAIL_TRIGGER_MULT / TRAIL_STEP_MULT as real position) ─
+        if pp["peak_fav"] >= trail_trigger:
+            locked_pts = pp["peak_fav"] - trail_step
+            if sig == "BUY":
+                new_sl    = round(entry + locked_pts, 2)
+                is_better = new_sl > pp["sl_spot"]
+            else:  # SELL: trail SL moves DOWN locking profit as Nifty falls
+                new_sl    = round(entry - locked_pts, 2)
+                is_better = new_sl < pp["sl_spot"]
+            if is_better:
+                old_sl          = pp["sl_spot"]
+                pp["sl_spot"]   = new_sl
+                pp["trail_active"] = True
+                pp["be_hit"]    = True
+                print(f"  [paper] {window} TRAIL: SL {old_sl:.2f} → {new_sl:.2f} (locked {locked_pts:.1f}pt)")
+                send_telegram(
+                    f"🔒 <b>PAPER TRACK — {win_label} Trail Updated</b>\n"
+                    f"New SL: <b>{new_sl:.2f}</b>  (was {old_sl:.2f})\n"
+                    f"Peak: +{pp['peak_fav']:.1f}pt  |  Locked: +{locked_pts:.1f}pt"
+                )
+
         if sig == "BUY":
             hit_sl = current_spot <= pp["sl_spot"]
         else:
             hit_sl = current_spot >= pp["sl_spot"]
+
         if hit_tgt:
             to_close.append((window, "TARGET", current_spot))
         elif hit_sl:
-            to_close.append((window, "BE" if pp["be_hit"] else "SL", current_spot))
+            outcome = "TRAIL" if pp["trail_active"] else ("BE" if pp["be_hit"] else "SL")
+            to_close.append((window, outcome, current_spot))
+
     for window, outcome, exit_spot in to_close:
         _close_paper_position(window, outcome, exit_spot)
 
@@ -1859,7 +1918,7 @@ def monitor_position(current_spot, option_ltp=None):
             if position["gtt_id"]:
                 ok = modify_gtt_sl(position["gtt_id"], position["symbol"], position["qty"],
                                    position["entry_premium"], position["target_premium"],
-                                   position["entry_premium"])
+                                   option_ltp if option_ltp else position["entry_premium"] + 0.1)
                 if ok:
                     position["breakeven_hit"] = True
                     position["sl_premium"]    = position["entry_premium"]
@@ -2228,6 +2287,7 @@ def send_eod_report():
 # ─── MAIN ───
 def run_scanner():
     global daily_pnl_rs, eod_report_sent, premarket_sent, spike_disarmed_today, SPIKE_ARMED
+    global live_trade_done_today, pe_signal_done_today
     print("="*65)
     print("  NIFTY MORNING SCANNER — CE ONLY + AUTO EXECUTION")
     print(f"  Window: {MORNING_START.strftime('%H:%M')}-{MORNING_END.strftime('%H:%M')}")
@@ -2248,20 +2308,27 @@ def run_scanner():
     alerts_today = 0
     last_dir     = None
     _today_str   = datetime.now().strftime("%Y-%m-%d")
-    _today_live  = [r for r in _load_signal_log()
-                    if r.get("date") == _today_str and r.get("mode") == "LIVE"]
+    _today_rows  = [r for r in _load_signal_log() if r.get("date") == _today_str]
+    _today_live  = [r for r in _today_rows if r.get("mode") == "LIVE"]
+    _today_ce    = [r for r in _today_rows if r.get("window", "regular_ce") == "regular_ce"]
+    _today_pe    = [r for r in _today_rows if r.get("window") in ("tuesday_pe", "evening_pe")]
+    # Restore CE count (covers SIGNAL + LIVE)
+    if _today_ce:
+        alerts_today = len(_today_ce)
+    # Restore PE flag
+    if _today_pe:
+        pe_signal_done_today = True
     if _today_live:
-        last_dir     = _today_live[-1].get("signal")   # BUY or SELL
-        alerts_today = len(_today_live)
+        last_dir = _today_live[-1].get("signal")
         _CLOSED_OUTCOMES = ("TARGET", "TRAIL", "SL", "BE", "WEAK", "EOD", "MANUAL", "GTT")
         _any_closed = any(r.get("outcome") in _CLOSED_OUTCOMES for r in _today_live)
         if _any_closed:
             live_trade_done_today = True
-        print(f"  [restore] {len(_today_live)} LIVE trade(s) already today — last_dir={last_dir} live_trade_done={live_trade_done_today}")
+        print(f"  [restore] CE={len(_today_ce)} PE={len(_today_pe)} LIVE={len(_today_live)} | ce_blocked={alerts_today>0} pe_blocked={pe_signal_done_today} live_done={live_trade_done_today}")
         send_telegram(
             f"♻️ <b>Scanner restarted mid-day</b>\n"
-            f"{len(_today_live)} LIVE trade(s) found today — signals BLOCKED for rest of day\n"
-            f"last_dir={last_dir} | alerts={alerts_today} | exec_blocked={live_trade_done_today}"
+            f"CE signals today: {len(_today_ce)} | PE signals today: {len(_today_pe)}\n"
+            f"CE blocked: {alerts_today >= MAX_ALERTS} | PE blocked: {pe_signal_done_today} | Live done: {live_trade_done_today}"
         )
 
     _s = get_live_stats()
@@ -2299,6 +2366,7 @@ def run_scanner():
                 window_opened_today = False
                 daily_pnl_rs         = 0.0
                 live_trade_done_today = False
+                pe_signal_done_today  = False
                 eod_report_sent      = False
                 premarket_sent       = False
                 spike_disarmed_today = False
@@ -2346,13 +2414,14 @@ def run_scanner():
                         if price:
                             print(f"  [{now.strftime('%H:%M')}] Tue Eve PE scan | Nifty:{price:.2f} | Signal:{sig or 'None'}")
                         sig_candle = df5.index[-2] if len(df5) >= 2 else None
-                        if sig == "SELL" and sig_candle != last_tue_eve_candle:
+                        if sig == "SELL" and sig_candle != last_tue_eve_candle and not pe_signal_done_today:
                             sl_dist = (info.get("prev_high", price) + CANDLE_SL_BUFFER) - price if info else 0
                             if sl_dist > MAX_CANDLE_SL_PTS:
                                 print(f"  ⚠️ Tue Eve PE SL too wide ({sl_dist:.0f}pt) — skipping")
                             else:
                                 last_tue_eve_candle = sig_candle
                                 tue_eve_alerts_today += 1
+                                pe_signal_done_today = True
                                 opt_ltp = None
                                 try:
                                     _sym = find_option_symbol(price, "SELL")
@@ -2368,6 +2437,12 @@ def run_scanner():
                         elif sig == "SIDEWAYS":
                             rng = info.get("recent_range", 0) if info else 0
                             print(f"  📊 Tue Eve sideways ({rng:.0f}pt) — waiting")
+                    if paper_positions:
+                        try:
+                            _pp_ltp  = kite.ltp(["NSE:NIFTY 50"])
+                            monitor_paper_positions(float(_pp_ltp["NSE:NIFTY 50"]["last_price"]))
+                        except Exception:
+                            pass
                     sleep_poll(1); continue
 
                 # ─── BETWEEN/AFTER WINDOWS ───────────────────────────────────
@@ -2386,8 +2461,26 @@ def run_scanner():
                         else:
                             send_telegram(f"🔒 <b>Tuesday evening window closed (14:00)</b> — {tue_eve_alerts_today} PE signal(s) sent today.")
                         tue_eve_window_opened = False
+                    if paper_positions:
+                        try:
+                            _pp_ltp  = kite.ltp(["NSE:NIFTY 50"])
+                            _pp_spot = float(_pp_ltp["NSE:NIFTY 50"]["last_price"])
+                            monitor_paper_positions(_pp_spot)
+                        except Exception as _pe:
+                            print(f"  [paper] LTP error: {_pe}")
+                    # Tuesday always continues before reaching the main EOD block — handle it here
+                    if not eod_report_sent and ct >= dtime(15, 30):
+                        eod_report_sent = True
+                        try:
+                            _eod_ltp  = kite.ltp(["NSE:NIFTY 50"])
+                            _eod_spot = float(_eod_ltp["NSE:NIFTY 50"]["last_price"])
+                        except Exception:
+                            _eod_spot = 0.0
+                        if paper_positions:
+                            close_all_paper_positions_eod(_eod_spot)
+                        send_eod_report()
                     print(f"⏳ [{now.strftime('%H:%M')}] Tuesday — outside PE windows (9:30-10:30 / 13:00-14:00)")
-                    sleep_poll(300); continue
+                    sleep_poll(30 if paper_positions else 300); continue
 
             # ─── PRE-MARKET ALERT (9:24-9:29) ────────────────────────────────
             if not premarket_sent and dtime(9, 24) <= ct <= dtime(9, 29):
@@ -2466,13 +2559,14 @@ def run_scanner():
                     if price:
                         print(f"  [{now.strftime('%H:%M')}] Eve PE scan | Nifty:{price:.2f} | Signal:{sig or 'None'}")
                     sig_candle = df5.index[-2] if len(df5) >= 2 else None
-                    if sig == "SELL" and sig_candle != last_eve_pe_candle:
+                    if sig == "SELL" and sig_candle != last_eve_pe_candle and not pe_signal_done_today:
                         sl_dist = (info.get("prev_high", price) + CANDLE_SL_BUFFER) - price if info else 0
                         if sl_dist > MAX_CANDLE_SL_PTS:
                             print(f"  ⚠️ Eve PE SL too wide ({sl_dist:.0f}pt) — skipping")
                         else:
                             last_eve_pe_candle = sig_candle
                             eve_pe_alerts_today += 1
+                            pe_signal_done_today = True
                             opt_ltp = None
                             try:
                                 _sym = find_option_symbol(price, "SELL")
@@ -2488,8 +2582,12 @@ def run_scanner():
                     elif sig == "SIDEWAYS":
                         rng = info.get("recent_range", 0) if info else 0
                         print(f"  📊 Eve PE sideways ({rng:.0f}pt) — waiting")
-                    if price and paper_positions:
-                        monitor_paper_positions(price)
+                if paper_positions:
+                    try:
+                        _pp_ltp  = kite.ltp(["NSE:NIFTY 50"])
+                        monitor_paper_positions(float(_pp_ltp["NSE:NIFTY 50"]["last_price"]))
+                    except Exception:
+                        pass
                 sleep_poll(1); continue
 
             # close notification once window ends
@@ -2503,8 +2601,15 @@ def run_scanner():
             # ─── OUTSIDE SCAN WINDOW — idle (spike detector still runs) ───
             if ct < MORNING_START or ct > MORNING_END:
                 check_spike()   # runs even outside morning window
-                print(f"⏳ [{now.strftime('%H:%M')}] Outside scan window (9:30-13:00) — idle")
-                sleep_poll(30 if SPIKE_ARMED else 120); continue
+                if paper_positions:
+                    try:
+                        _pp_ltp  = kite.ltp(["NSE:NIFTY 50"])
+                        _pp_spot = float(_pp_ltp["NSE:NIFTY 50"]["last_price"])
+                        monitor_paper_positions(_pp_spot)
+                    except Exception as _pe:
+                        print(f"  [paper] LTP error: {_pe}")
+                print(f"⏳ [{now.strftime('%H:%M')}] Outside scan window — idle")
+                sleep_poll(30 if (SPIKE_ARMED or paper_positions) else 120); continue
 
             if not window_opened_today:
                 window_opened_today = True
@@ -2531,8 +2636,14 @@ def run_scanner():
                 )
 
             if alerts_today >= MAX_ALERTS:
+                if paper_positions:
+                    try:
+                        _pp_ltp  = kite.ltp(["NSE:NIFTY 50"])
+                        monitor_paper_positions(float(_pp_ltp["NSE:NIFTY 50"]["last_price"]))
+                    except Exception:
+                        pass
                 print(f"🚫 Max alerts reached ({MAX_ALERTS}) — idle till next day")
-                sleep_poll(120); continue
+                sleep_poll(30 if paper_positions else 120); continue
 
             df5 = fetch_data(NIFTY_TOKEN, "5minute", days=5)
             if df5 is None:
