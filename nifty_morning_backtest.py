@@ -552,6 +552,156 @@ def run_evening_pe_backtest(df5, days=90, bt_lots=1):
     return tdf.to_dict('records'), summary
 
 
+def _test_sd_zone_filter(df5, trades, label, sep="="*72):
+    """
+    Generic 15-min S&D zone filter test for any window.
+    BUY signals → looks for 15-min DEMAND zones (price near zone low + buffer).
+    SELL signals → looks for 15-min SUPPLY zones (price near zone high - buffer).
+    Context: same-day candles before signal time + prev 2 trading days.
+    """
+    if not trades:
+        print(f"\n  {label} — no trades to test.")
+        return
+
+    # Resample 5-min → 15-min, strip timezone
+    df15 = df5.resample('15T').agg(
+        Open=('Open', 'first'), High=('High', 'max'),
+        Low=('Low', 'min'),   Close=('Close', 'last')
+    ).dropna()
+    if df15.index.tz is not None:
+        df15.index = df15.index.tz_localize(None)
+
+    sig_type = trades[0]['signal']   # 'BUY' or 'SELL'
+    zone_lbl = "demand" if sig_type == "BUY" else "supply"
+
+    def get_zones(trade_date, signal_time_str, impulse_pt=20, base_range_pt=25):
+        sig_dt   = pd.Timestamp(f"{trade_date} {signal_time_str}")
+        same_day = df15[(df15.index.date == trade_date) & (df15.index < sig_dt)]
+        prev_days = df15[df15.index.date < trade_date]
+        if not prev_days.empty:
+            last2  = set(sorted(set(prev_days.index.date))[-2:])
+            prev_2 = prev_days[[d in last2 for d in prev_days.index.date]]
+        else:
+            prev_2 = pd.DataFrame()
+        cands = pd.concat([prev_2, same_day]).sort_index() if not prev_2.empty else same_day
+        if len(cands) < 3:
+            return []
+
+        zones = []
+        for i in range(1, len(cands) - 1):
+            h  = float(cands.iloc[i]['High'])
+            l  = float(cands.iloc[i]['Low'])
+            o  = float(cands.iloc[i]['Open'])
+            c  = float(cands.iloc[i]['Close'])
+            ph = float(cands.iloc[i-1]['High']); pl = float(cands.iloc[i-1]['Low'])
+            nh = float(cands.iloc[i+1]['High']); nl = float(cands.iloc[i+1]['Low'])
+
+            if sig_type == "SELL":
+                # Supply: bullish candle followed by bearish impulse drop
+                if c > o and (h - nl) >= impulse_pt:
+                    zones.append((min(o,c), h))
+                # Swing high
+                if h > ph and h > nh:
+                    zones.append((h - base_range_pt, h))
+            else:
+                # Demand: bearish candle followed by bullish impulse rise
+                if c < o and (nh - l) >= impulse_pt:
+                    zones.append((l, max(o,c)))
+                # Swing low
+                if l < pl and l < nl:
+                    zones.append((l, l + base_range_pt))
+        return zones
+
+    def near_zone(price, zones, buf):
+        for zl, zh in zones:
+            if sig_type == "SELL":
+                if zh - buf <= price <= zh:        # within buf pts BELOW zone high
+                    return True
+            else:
+                if zl <= price <= zl + buf:        # within buf pts ABOVE zone low
+                    return True
+        return False
+
+    def stats(tlist):
+        if not tlist:
+            return dict(n=0, wr=0.0, net=0, sl=0, weak=0, be=0)
+        w = sum(1 for t in tlist if t['outcome'] in ('TARGET','TRAIL'))
+        return dict(n=len(tlist), wr=w/len(tlist)*100,
+                    net=round(sum(t['pnl_rs'] for t in tlist)),
+                    sl  =sum(1 for t in tlist if t['outcome']=='SL'),
+                    weak=sum(1 for t in tlist if t['outcome']=='WEAK'),
+                    be  =sum(1 for t in tlist if t['outcome']=='BE'))
+
+    base = stats(trades)
+    print(); print(sep)
+    print(f"  {label} — 15-MIN {zone_lbl.upper()} ZONE FILTER TEST")
+    print(f"  {zone_lbl.title()} zone = 15-min orderblock + swing {'low' if sig_type=='BUY' else 'high'}")
+    print(f"  Context: same-day candles before signal + prev 2 days | 90-day backtest")
+    print(sep)
+    print(f"  Baseline : {base['n']} trades | {base['wr']:.1f}% WR | "
+          f"SL={base['sl']} WEAK={base['weak']} BE={base['be']} | Rs{base['net']:,}")
+    if base['n'] < 8:
+        print(f"  ⚠️  Only {base['n']} trades — low sample, treat results as directional only")
+    print()
+    print(f"  {'Buffer':>8}  {'Near n':>6}  {'Near WR':>8}  {'Near Net':>10}  "
+          f"{'Away n':>6}  {'Away WR':>8}  {'WR Δ':>7}  Verdict")
+    print(f"  {'-'*82}")
+
+    best = {'buf': None, 'wr': base['wr'], 'n': 0}
+    for buf in [15, 20, 25, 30, 40]:
+        near, away = [], []
+        for t in trades:
+            td    = pd.Timestamp(t['date']).date()
+            ttime = str(t.get('time', '09:30'))
+            zs    = get_zones(td, ttime)
+            (near if near_zone(t['entry'], zs, buf) else away).append(t)
+        sn = stats(near); sa = stats(away)
+        dwr = sn['wr'] - base['wr'] if sn['n'] else 0
+        min_n = 5 if base['n'] >= 10 else 3
+        verdict = ("BETTER ✅" if dwr >  3 and sn['n'] >= min_n else
+                   "MIXED  ⚠️" if dwr >= 0 and sn['n'] >= min_n else
+                   "WORSE  ❌" if sn['n'] >= min_n else "TOO FEW")
+        if sn['n'] >= min_n and sn['wr'] > best['wr']:
+            best = {'buf': buf, 'wr': sn['wr'], 'n': sn['n']}
+        wr_n = f"{sn['wr']:>7.1f}%" if sn['n'] else "      —"
+        wr_a = f"{sa['wr']:>7.1f}%" if sa['n'] else "      —"
+        print(f"  {buf:>6}pt  {sn['n']:>6}  {wr_n}  Rs{sn['net']:>8,}  "
+              f"{sa['n']:>6}  {wr_a}  {dwr:>+6.1f}%  {verdict}")
+
+    # Per-trade breakdown at best (or 25pt default)
+    show_buf = best['buf'] or 25
+    near, away = [], []
+    for t in trades:
+        td    = pd.Timestamp(t['date']).date()
+        ttime = str(t.get('time', '09:30'))
+        zs    = get_zones(td, ttime)
+        (near if near_zone(t['entry'], zs, show_buf) else away).append(t)
+    near_ids = set(id(t) for t in near)
+
+    print()
+    print(f"  Per-trade (buf={show_buf}pt):")
+    print(f"  {'Date':<12} {'Time':<6} {'Entry':>8} {'Outcome':<8} {'PnL':>8}  Zone")
+    print(f"  {'-'*64}")
+    for t in trades:
+        z    = "✅ NEAR" if id(t) in near_ids else "❌ AWAY"
+        icon = "🟢" if t['outcome'] in ('TARGET','TRAIL') else \
+               "🔴" if t['outcome'] == 'SL' else "⚪"
+        print(f"  {str(t['date']):<12} {str(t.get('time','')):<6} "
+              f"{t['entry']:>8.1f} {t['outcome']:<8} Rs{t['pnl_rs']:>6.0f}  {z} {icon}")
+
+    sn_b = stats(near); sa_b = stats(away)
+    print()
+    if best['buf']:
+        print(f"  IF APPLIED (buf={show_buf}pt):")
+        print(f"    Keep (near) : {sn_b['n']} trades | {sn_b['wr']:.1f}% WR | Rs{sn_b['net']:,}")
+        print(f"    Filter (away): {sa_b['n']} trades | {sa_b['wr']:.1f}% WR | Rs{sa_b['net']:,}")
+        print(f"    WR  : {base['wr']:.1f}% → {sn_b['wr']:.1f}% ({sn_b['wr']-base['wr']:+.1f}%)")
+        print(f"    PnL : Rs{base['net']:,} → Rs{sn_b['net']:,} ({sn_b['net']-base['net']:+,})")
+    else:
+        print(f"  No buffer improved WR — 15-min {zone_lbl} zone filter not conclusive for {label}.")
+    print(sep)
+
+
 # ─── MAIN ───
 def main():
     sep = "="*72
@@ -881,6 +1031,13 @@ def main():
             print(f"  {str(r['date']):<12} {str(r.get('time','')):<6} "
                   f"{r['entry']:>8.1f} {r['outcome']:<8} Rs{r['pnl_rs']:>6.0f} {r['max_fav']:>7.1f}pt")
         print(sep)
+
+    # ── 15-min S&D Zone Filter Tests — all windows ───────────────────────
+    _test_sd_zone_filter(df5, tdf.to_dict('records'),   "CE MORNING (BUY)",       sep)
+    _test_sd_zone_filter(df5, m_trades,                  "TUESDAY MORNING PE",     sep)
+    _test_sd_zone_filter(df5, e_trades,                  "TUESDAY EVENING PE",     sep)
+    if ep_trades:
+        _test_sd_zone_filter(df5, ep_trades,             "EVENING PE (Mon/Wed/Thu/Fri)", sep)
 
     # ── GRAND TOTAL (main + Tuesday + Evening PE) ─────────────────────────
     print()
