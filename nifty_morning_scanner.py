@@ -132,6 +132,7 @@ premarket_sent     = False  # True after 9:25 AM pre-market alert sent today
 spike_disarmed_today = False  # True after spike auto-disarmed at 2:40 PM today
 live_trade_done_today = False  # True once a LIVE position closes — blocks second execution same day
 pe_signal_done_today  = False  # True once any PE signal (tuesday_pe / evening_pe) is logged today
+_last_error_tg     = 0.0    # throttle: epoch of last error Telegram alert (max 1 per 5 min)
 
 SPIKE_ARMED     = False  # separate from AUTO_ARMED — monitors intracandle momentum
 SPIKE_THRESHOLD = int(os.getenv("SPIKE_THRESHOLD", "50"))  # pts move within a 5-min candle
@@ -639,6 +640,7 @@ def process_telegram_commands():
                 "/status — armed state + open position\n"
                 "/today — today's trades + P&L\n"
                 "/live_log — full signal log + CSV\n"
+                "/monthly — month-to-date P&L breakdown by window\n"
                 "/square_off — emergency close open position\n"
                 "/buy_ce — manual CE entry at current ATM price\n"
                 "/buy_pe — manual PE entry at current ATM price\n"
@@ -733,6 +735,57 @@ def process_telegram_commands():
                 import os
                 if os.path.exists(SIGNAL_LOG_FILE):
                     send_telegram_file(SIGNAL_LOG_FILE, caption="live_signal_log.csv")
+
+        elif text == "/monthly":
+            rows = _load_signal_log()
+            curr_month  = datetime.now().strftime('%Y-%m')
+            month_label = datetime.now().strftime('%B %Y')
+            month_rows  = [r for r in rows if r.get('date','').startswith(curr_month)]
+            _WIN  = ('TARGET', 'TRAIL', 'GTT')
+            _OPEN = ('', 'SIGNAL', 'OPEN')
+            month_closed = [r for r in month_rows if r.get('outcome','') not in _OPEN]
+            if not month_closed:
+                send_telegram(f"📅 <b>Monthly Report — {month_label}</b>\n\nNo closed trades this month yet.")
+            else:
+                _WIN_LABELS = {
+                    'regular_ce': '📈 CE Morning  (9:30-10:30)',
+                    'tuesday_pe': '📉 Tuesday PE  (13:00-14:00)',
+                    'evening_pe': '🌆 Evening PE  (13:00-14:00)',
+                }
+                _OC_ICONS = {'TARGET':'🎯','TRAIL':'🏃','BE':'⚖️','WEAK':'😴','SL':'❌','EOD':'⏰','GTT':'🎯'}
+                m_wins = sum(1 for r in month_closed if r.get('outcome','') in _WIN)
+                m_sls  = sum(1 for r in month_closed if r.get('outcome','') == 'SL')
+                m_pnl  = sum(float(r.get('pnl_rs') or 0) for r in month_closed)
+                m_wr   = round(m_wins / len(month_closed) * 100, 1)
+                m_icon = "🟢" if m_pnl >= 0 else "🔴"
+                lines  = [
+                    f"📅 <b>Monthly Report — {month_label}</b>",
+                    f"{m_icon} <b>{len(month_closed)} trades | ✅{m_wins} ❌{m_sls} | WR {m_wr}% | ₹{m_pnl:+,.0f}</b>",
+                    "─" * 30,
+                ]
+                win_groups = {}
+                for r in month_rows:
+                    w = r.get('window','') or 'regular_ce'
+                    win_groups.setdefault(w, []).append(r)
+                for win_key in ('regular_ce', 'tuesday_pe', 'evening_pe'):
+                    if win_key not in win_groups:
+                        continue
+                    wrows   = win_groups[win_key]
+                    wclosed = [r for r in wrows if r.get('outcome','') not in _OPEN]
+                    if not wclosed:
+                        continue
+                    wwins = sum(1 for r in wclosed if r.get('outcome','') in _WIN)
+                    wsls  = sum(1 for r in wclosed if r.get('outcome','') == 'SL')
+                    wpnl  = sum(float(r.get('pnl_rs') or 0) for r in wclosed)
+                    wwr   = round(wwins / len(wclosed) * 100, 1) if wclosed else 0
+                    lines.append(f"\n<b>{_WIN_LABELS.get(win_key, win_key)}</b>")
+                    lines.append(f"  {len(wclosed)} trades | ✅{wwins} ❌{wsls} | WR {wwr}% | ₹{wpnl:+,.0f}")
+                    for r in wclosed:
+                        oc    = r.get('outcome','')
+                        icon  = _OC_ICONS.get(oc, '•')
+                        pnl_r = float(r.get('pnl_rs') or 0)
+                        lines.append(f"    {icon} {r.get('date','')} {r.get('time','')}  {oc}  ₹{pnl_r:+,.0f}")
+                send_telegram("\n".join(lines))
 
 
 def sleep_poll(seconds):
@@ -2281,6 +2334,23 @@ def send_eod_report():
             block, _ = _window_block(win_key, win_rows)
             msg_lines.extend(block)
 
+    # Month-to-date summary
+    curr_month   = datetime.now().strftime('%Y-%m')
+    month_rows   = [r for r in rows if r.get('date','').startswith(curr_month)]
+    month_closed = [r for r in month_rows if r.get('outcome','') not in OPEN_OUTCOMES]
+    if month_closed:
+        m_wins = sum(1 for r in month_closed if r.get('outcome','') in WIN_OUTCOMES)
+        m_sls  = sum(1 for r in month_closed if r.get('outcome','') == 'SL')
+        m_pnl  = sum(float(r.get('pnl_rs') or 0) for r in month_closed)
+        m_wr   = round(m_wins / len(month_closed) * 100, 1)
+        m_icon = "🟢" if m_pnl >= 0 else "🔴"
+        msg_lines += [
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"📅 <b>Month-to-Date — {datetime.now().strftime('%b %Y')}</b>",
+            f"  {len(month_closed)} closed | ✅{m_wins} ❌{m_sls} | WR {m_wr}% | {m_icon} ₹{m_pnl:+,.0f}",
+        ]
+
     send_telegram("\n".join(msg_lines))
 
 
@@ -2601,6 +2671,18 @@ def run_scanner():
             # ─── OUTSIDE SCAN WINDOW — idle (spike detector still runs) ───
             if ct < MORNING_START or ct > MORNING_END:
                 check_spike()   # runs even outside morning window
+                if window_opened_today and ct > MORNING_END:
+                    if alerts_today == 0:
+                        send_telegram(
+                            f"🔒 <b>CE window closed ({MORNING_END.strftime('%H:%M')})</b> — no signal today.\n"
+                            "🌆 Evening PE opens at 13:00."
+                        )
+                    else:
+                        send_telegram(
+                            f"🔒 <b>CE window closed ({MORNING_END.strftime('%H:%M')})</b> — {alerts_today} signal(s) fired today.\n"
+                            "🌆 Evening PE opens at 13:00."
+                        )
+                    window_opened_today = False
                 if paper_positions:
                     try:
                         _pp_ltp  = kite.ltp(["NSE:NIFTY 50"])
@@ -2737,7 +2819,16 @@ def run_scanner():
             print("\n⛔ Morning scanner stopped.")
             send_telegram("⛔ Morning scanner stopped."); break
         except Exception as e:
-            print(f"❌ Error: {e}"); sleep_poll(60)
+            print(f"❌ Error: {e}")
+            global _last_error_tg
+            if time.time() - _last_error_tg > 300:
+                _last_error_tg = time.time()
+                send_telegram(
+                    f"⚠️ <b>Bot Error — auto-retry in 60s</b>\n"
+                    f"{datetime.now().strftime('%H:%M:%S')}\n"
+                    f"<code>{str(e)[:300]}</code>"
+                )
+            sleep_poll(60)
 
 if __name__ == "__main__":
     run_scanner()
