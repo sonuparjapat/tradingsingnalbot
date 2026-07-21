@@ -1217,7 +1217,7 @@ def log_live_signal(signal, price, sl_ref, symbol="", entry_premium=0,
     # Open a virtual paper position to auto-track outcome (target/SL/EOD) in the CSV
     # Skip regular_ce when AUTO_ARMED — real position monitor will handle it instead
     if mode == "SIGNAL" and not (AUTO_ARMED and window == "regular_ce"):
-        _open_paper_position(signal, round(price, 2), sl_spot, target_spot, _tgt, window, now, entry_premium=option_ltp or 0)
+        _open_paper_position(signal, round(price, 2), sl_spot, target_spot, _tgt, window, now, entry_premium=option_ltp or 0, info=info)
 
 def update_log_last_open(**kwargs):
     """Promote the most recent SIGNAL row to OPEN — called after order actually fills."""
@@ -1244,7 +1244,7 @@ def log_live_exit(outcome, exit_spot=0, exit_premium=0, pnl_rs=0, max_fav_pt=0):
     print(f"  [log] Exit logged: {outcome}")
 
 # ─── PAPER POSITION TRACKER (virtual outcome for signal-only signals) ────────
-def _open_paper_position(signal, entry_spot, sl_spot, target_spot, target_pts, window, open_time, entry_premium=0):
+def _open_paper_position(signal, entry_spot, sl_spot, target_spot, target_pts, window, open_time, entry_premium=0, info=None):
     """Register a virtual position to track outcome even when no real order is placed."""
     be_threshold = entry_spot * BREAKEVEN_PCT
     paper_positions[window] = {
@@ -1254,13 +1254,20 @@ def _open_paper_position(signal, entry_spot, sl_spot, target_spot, target_pts, w
         "sl_original":   sl_spot,
         "target_spot":   target_spot,
         "target_pts":    target_pts,
+        "window":        window,
         "date_str":      open_time.strftime("%Y-%m-%d"),
         "time_str":      open_time.strftime("%H:%M"),
+        "open_time":     open_time,
         "peak_fav":      0.0,
         "be_hit":        False,
         "trail_active":  False,
+        "weak_checked":  False,
         "be_threshold":  be_threshold,
         "entry_premium": entry_premium or 0,
+        # Context for post-trade analysis
+        "vwap":          float(info["vwap"])       if info and "vwap"      in info else None,
+        "prev_bull":     bool(info["prev_bull"])   if info and "prev_bull" in info else None,
+        "prev_lw_pct":   float(info["prev_lw_pct"]) if info and "prev_lw_pct" in info else None,
     }
     print(f"  [paper] {window} opened: {signal} @ {entry_spot:.2f} | sl={sl_spot:.2f} | tgt={target_spot:.2f} | be_thresh={be_threshold:.1f}pt")
 
@@ -1269,6 +1276,89 @@ _PAPER_WIN_LABELS = {
     "evening_pe": "Evening PE",
     "tuesday_pe": "Tuesday PE",
 }
+
+def _pe_failure_analysis(pp, outcome):
+    """Build a diagnostic Telegram message when a PE paper position closes as SL or WEAK."""
+    entry     = pp["entry_spot"]
+    sl_orig   = pp["sl_original"]
+    max_fav   = round(pp.get("peak_fav", 0), 1)
+    vwap      = pp.get("vwap")
+    prev_bull = pp.get("prev_bull")
+    pc_lw     = pp.get("prev_lw_pct")
+    win_label = _PAPER_WIN_LABELS.get(pp.get("window",""), "PE")
+    open_time = pp.get("open_time")
+
+    vwap_dist = round(vwap - entry, 1) if vwap else None
+    sl_dist   = round(abs(sl_orig - entry), 1)
+    r50       = (entry // 50) * 50
+    dist_50   = round(entry - r50, 1)
+    duration  = round((datetime.now() - open_time).total_seconds() / 60) if open_time else None
+
+    lines = [
+        f"🔍 <b>TRADE DEBRIEF — {win_label}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"SELL @ {entry:.2f}  →  <b>{outcome}</b>  |  Max move: +{max_fav:.1f}pt",
+        "",
+        "📊 <b>Context at entry:</b>",
+    ]
+
+    # VWAP distance
+    if vwap_dist is not None:
+        if vwap_dist > 40:
+            lines.append(f"  🔴 VWAP: {vwap_dist:.1f}pt away — HIGH mean-reversion risk")
+            lines.append(f"     (Price this far below VWAP → market likely to snap back up)")
+        elif vwap_dist > 25:
+            lines.append(f"  🟡 VWAP: {vwap_dist:.1f}pt away — moderate risk")
+        else:
+            lines.append(f"  ✅ VWAP: {vwap_dist:.1f}pt — close to VWAP, acceptable")
+
+    # 50pt support
+    if dist_50 < 20:
+        lines.append(f"  🔴 50pt support at {r50:.0f} only {dist_50:.0f}pt below — bounce zone")
+    else:
+        lines.append(f"  ✅ 50pt support at {r50:.0f} ({dist_50:.0f}pt away) — clear")
+
+    # Prev candle
+    if prev_bull is not None:
+        if prev_bull:
+            lw_s = f" (lower wick {pc_lw:.0f}%)" if pc_lw else ""
+            lines.append(f"  🔴 Prev candle: BULLISH{lw_s} — buyers pushing back before our breakdown")
+        else:
+            lw_s = f" (lower wick {pc_lw:.0f}%)" if pc_lw else ""
+            lines.append(f"  ✅ Prev candle: BEARISH{lw_s} — direction confirmed")
+
+    lines += ["", "⏱️ <b>What happened after entry:</b>"]
+    if max_fav < 2:
+        lines.append(f"  🚨 Zero momentum — market went against us from candle 1")
+    elif max_fav < 5:
+        lines.append(f"  ⚠️ Barely moved our way ({max_fav:.1f}pt) — no real follow-through")
+    else:
+        lines.append(f"  ➡️ Moved {max_fav:.1f}pt our way then reversed to SL")
+
+    if outcome == "WEAK" and duration:
+        saved = round((sl_dist - max_fav) * OPTION_DELTA * LOT_SIZE)
+        lines.append(f"  ✂️ WEAK exit at 15min saved approx ₹{saved:,} vs waiting for full SL")
+    elif duration:
+        lines.append(f"  ⏱️ SL hit in ~{duration} min")
+
+    # What filters would have helped
+    blocks = []
+    if vwap_dist and vwap_dist > 35:
+        blocks.append(f"VWAP distance filter (>35pt = skip) — {vwap_dist:.0f}pt exceeded threshold")
+    if dist_50 < 20:
+        blocks.append(f"50pt support filter — already active ✅ (this won't repeat)")
+    if prev_bull:
+        blocks.append("Prev candle bearish check — would have flagged buyer resistance")
+
+    if blocks:
+        lines += ["", "💡 <b>Filters that would have flagged this:</b>"]
+        for b in blocks:
+            lines.append(f"  • {b}")
+    else:
+        lines += ["", "💡 <b>Verdict:</b> All entry checks passed — market moved against a valid setup.",
+                  "   This is normal variance. The edge shows over 20+ trades, not 1."]
+
+    return "\n".join(lines)
 
 def _close_paper_position(window, outcome, exit_spot):
     """Close a paper position and write outcome + P&L back to live_signal_log.csv."""
@@ -1305,15 +1395,34 @@ def _close_paper_position(window, outcome, exit_spot):
             r["exit_time"]    = datetime.now().strftime("%H:%M")
             break
     _save_signal_log(rows)
-    pnl_icon  = "💰" if pnl_rs >= 0 else "🔴"
     win_label = _PAPER_WIN_LABELS.get(window, window.upper())
+    _OC = {
+        "TARGET": ("🎯🔥", "Target hit clean — strategy working exactly as designed!"),
+        "TRAIL":  ("🏃💰", "Locked in profit via trail — disciplined exit!"),
+        "BE":     ("⚖️",   "Breakeven — capital protected. Market hesitated, we adapted."),
+        "WEAK":   ("✂️😴", f"Smart cut — no momentum after 15 min. Saved capital for the next setup."),
+        "SL":     ("❌💪", "Stop loss respected — every strategy takes losses. What matters is staying consistent."),
+        "EOD":    ("⏰",   "Day ended — position closed at market."),
+    }
+    icon, msg = _OC.get(outcome, ("📊", "Position closed."))
+    pnl_icon  = "💰" if pnl_rs >= 0 else "🔴"
+
     send_telegram(
-        f"📊 <b>PAPER TRACK — {win_label} CLOSED ({outcome})</b>\n\n"
-        f"{pnl_icon} P&L: ₹{pnl_rs:+,.0f}  |  Max move: +{max_fav:.1f}pt\n"
-        f"Exit spot: {exit_spot:.2f}"
+        f"{icon} <b>{win_label} — {outcome}</b>\n\n"
+        f"{msg}\n\n"
+        f"{pnl_icon} P&L: <b>₹{pnl_rs:+,.0f}</b>  |  Max move: +{max_fav:.1f}pt\n"
+        f"📍 Exit: {exit_spot:.2f}"
         + (f"  |  Option: ₹{exit_premium}" if exit_premium else "")
     )
     print(f"  [paper] {window} closed: {outcome} | pnl_pts={pnl_pts:.1f} | Rs{pnl_rs:+.0f}")
+
+    # Post-trade failure analysis for SL / WEAK outcomes
+    if outcome in ("SL", "WEAK") and window in ("evening_pe", "tuesday_pe"):
+        try:
+            analysis = _pe_failure_analysis(pp, outcome)
+            send_telegram(analysis)
+        except Exception as _ae:
+            print(f"  [paper] analysis error: {_ae}")
 
 def monitor_paper_positions(current_spot):
     """Check virtual exit conditions — identical BE/trail logic to real CE/PE execution."""
@@ -1335,6 +1444,15 @@ def monitor_paper_positions(current_spot):
             hit_tgt   = current_spot <= tgt
 
         pp["peak_fav"] = max(pp["peak_fav"], spot_move)
+
+        # ── Weak exit: if after 15 min max_fav < MOMENTUM_MIN → cut loss early ──
+        if not pp["weak_checked"] and pp.get("open_time"):
+            elapsed = (datetime.now() - pp["open_time"]).total_seconds() / 60
+            if elapsed >= 15:
+                pp["weak_checked"] = True
+                if pp["peak_fav"] < MOMENTUM_MIN:
+                    to_close.append((window, "WEAK", current_spot))
+                    continue
 
         # ── Breakeven (same threshold as real position) ──────────────────
         if not pp["be_hit"] and pp["peak_fav"] >= be_threshold:
@@ -1515,6 +1633,8 @@ def check_tuesday_signals(df5):
     cond_brk   = price < pl          # breakdown below prev candle low
     cond_clean = bear_clean
 
+    _pc_bull   = float(prev['Close']) > float(prev['Open'])
+    _pc_lw_pct = round(_prev_lw / _prev_body * 100, 1) if _prev_body > 0 else 0
     info = {
         "vwap": vwap, "st": st,
         "prev_low": pl, "prev_high": ph,
@@ -1522,9 +1642,16 @@ def check_tuesday_signals(df5):
         "cond_vwap_bear": cond_vwap,
         "cond_st_bear":   cond_st,
         "cond_brk_bear":  cond_brk,
+        "prev_bull":      _pc_bull,
+        "prev_lw_pct":    _pc_lw_pct,
     }
 
     if all([cond_vwap, cond_st, cond_brk, cond_clean, pe_b1_ok]):
+        # 50pt support filter: skip if round 50pt level is within 20pt below entry
+        _r50 = (price // 50) * 50
+        if price - _r50 < 20:
+            info["skip_50pt"] = int(_r50)
+            return "SKIP_SUPPORT", price, info
         return "SELL", price, info
     return None, price, info
 
@@ -2351,6 +2478,19 @@ def send_eod_report():
             f"  {len(month_closed)} closed | ✅{m_wins} ❌{m_sls} | WR {m_wr}% | {m_icon} ₹{m_pnl:+,.0f}",
         ]
 
+    # Motivational / celebratory closing line
+    if total_pnl > 3000:
+        msg_lines += ["", "🔥 Excellent day! Strategy firing on all cylinders. Keep the discipline going!"]
+    elif total_pnl > 0:
+        msg_lines += ["", "✅ Profitable day — consistent execution beats prediction every time. Well done!"]
+    elif total_pnl == 0 or not all_closed:
+        msg_lines += ["", "⚪ No closed P&L today. Waiting for quality setups IS the strategy."]
+    elif total_pnl > -1000:
+        msg_lines += ["", "💪 Small setback. The edge plays out over 100 trades, not 1. Stay the course."]
+    else:
+        msg_lines += ["", "🏋️ Tough day — happens to every strategy. Review it, learn from it, move on.",
+                      "   The next setup doesn't know about today. Stay disciplined."]
+
     send_telegram("\n".join(msg_lines))
 
 
@@ -2504,6 +2644,9 @@ def run_scanner():
                                 # Cross-log to live_signal_log.csv for unified tracking
                                 _tue_ph = info.get("prev_high", price) if info else price
                                 log_live_signal("SELL", price, _tue_ph, mode="SIGNAL", info=info, option_ltp=opt_ltp, window="tuesday_pe")
+                        elif sig == "SKIP_SUPPORT":
+                            _r50 = info.get("skip_50pt", "?") if info else "?"
+                            print(f"  ⛔ Tue Eve PE SKIP — 50pt support at {_r50} within 20pt of entry ({price:.1f})")
                         elif sig == "SIDEWAYS":
                             rng = info.get("recent_range", 0) if info else 0
                             print(f"  📊 Tue Eve sideways ({rng:.0f}pt) — waiting")
@@ -2649,6 +2792,9 @@ def run_scanner():
                             # Cross-log to live_signal_log.csv for unified tracking
                             _eve_ph = info.get("prev_high", price) if info else price
                             log_live_signal("SELL", price, _eve_ph, mode="SIGNAL", info=info, option_ltp=opt_ltp, window="evening_pe")
+                    elif sig == "SKIP_SUPPORT":
+                        _r50 = info.get("skip_50pt", "?") if info else "?"
+                        print(f"  ⛔ Eve PE SKIP — 50pt support at {_r50} within 20pt of entry ({price:.1f})")
                     elif sig == "SIDEWAYS":
                         rng = info.get("recent_range", 0) if info else 0
                         print(f"  📊 Eve PE sideways ({rng:.0f}pt) — waiting")
@@ -2708,11 +2854,11 @@ def run_scanner():
                     f"{armed_label}"
                 )
 
-            # ─── NO SIGNAL ALERT (11:30 AM) ───────────────────────────────────
-            if not no_signal_alerted and alerts_today == 0 and ct >= dtime(11, 30):
+            # ─── NO SIGNAL ALERT (10:10 AM — 20 min before window close) ──────
+            if not no_signal_alerted and alerts_today == 0 and ct >= dtime(10, 10):
                 no_signal_alerted = True
                 send_telegram(
-                    f"📭 <b>No CE signal by 11:30 AM</b>\n\n"
+                    f"📭 <b>No CE signal by 10:10 AM</b>\n\n"
                     f"Market may be sideways or conditions not aligning.\n"
                     f"Continuing to scan till {MORNING_END.strftime('%H:%M')} — stay patient."
                 )

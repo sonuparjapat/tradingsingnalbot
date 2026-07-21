@@ -324,6 +324,13 @@ def run_backtest(df5, days=60, ce_only=False, candle_sl=False,
             if green_count < green_bias_n * green_bias_min_pct:
                 continue
 
+        # ── 50pt support filter for PE: skip if nearest round 50pt level
+        #    is within 20pt below entry — market likely bounces there before target
+        if signal == "SELL":
+            _r50 = (price // 50) * 50
+            if price - _r50 < 20:
+                continue
+
         last_sig[date] = signal
 
         # Simulate delayed fill: enter N pts above signal price

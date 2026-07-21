@@ -1,0 +1,4 @@
+  File "<stdin>", line 75
+    signal = BUY ✅ if all([cond_vwap, cond_st, cond_brk, bull_clean, b1]) else -
+                 ^
+SyntaxError: invalid character '✅' (U+2705)
